@@ -1,0 +1,151 @@
+############################ ячейка 1 - импорт модулей #######################
+from google.colab import files #для загрузки файлов в Google Colab
+import pandas as pd #для обработки и анализа данных
+import matplotlib.pyplot as plt #для визуализаций
+from sklearn.model_selection import train_test_split #для разделения данных на обучающую и тестовую выборки
+from sklearn.ensemble import RandomForestRegressor #регрессор случайного леса из модуля ensemble библиотеки sklearn
+import shap #для интерпретации моделей машинного обучения
+
+
+############################ ячейка 2 - чтение CSV-файла в датафреймы #######################
+df_applications = pd.read_csv('/content/applications.csv', sep=',', encoding='utf-8') #датасет с заявками
+df_customers = pd.read_csv('/content/customers.csv', sep=',', encoding='utf-8') #датасет с клиентами
+df_managers = pd.read_csv('/content/managers.csv', sep=',', encoding='utf-8') #датасет с менеджерами
+df_documents = pd.read_csv('/content/documents.csv', sep=',', encoding='utf-8') #датасет с документами
+df_contracts_content = pd.read_csv('/content/contracts_content.csv', sep=',', encoding='utf-8') #датасет с содержимым документов
+df_products = pd.read_csv('/content/products.csv', sep=',', encoding='utf-8') #датасет с продуктами
+df_providers = pd.read_csv('/content/providers.csv', sep=',', encoding='utf-8') #датасет с поставщиками
+df_payments = pd.read_csv('/content/payments.csv', sep=',', encoding='utf-8') #датасет с платежами
+
+
+############################ ячейка 3 - обучение ML-модели и интерпретация результатов #######################
+# Шаг 1: Объединение датасетов на основе ИНН и Названия контрагента
+# сначала надо обработать все явные совпадения по ИНН, а затем попытаться найти дополнительные совпадения по названию контрагента, повышая полноту и точность объединенных данных
+merged_df = pd.merge(
+    df_documents,
+    df_customers,
+    left_on='ИНН контрагента',
+    right_on='ИНН',
+    how='left',
+    suffixes=('_doc', '_cust')
+)
+
+# Подсчитываем количество записей без совпадений по ИНН в столбце 'ID клиента'
+missing_inn = merged_df['ID клиента'].isnull().sum()
+print(f"Количество записей без совпадений по ИНН: {missing_inn}")
+
+# Проверяем, есть ли отсутствующие ИНН
+if missing_inn > 0:
+    # Создаем DataFrame с заполненными ИНН
+    matched_df = merged_df[merged_df['ID клиента'].notnull()]
+
+    # Создаем DataFrame с отсутствующими ИНН и удаляем дублирующиеся столбцы из df_customers
+    unmatched_df = merged_df[merged_df['ID клиента'].isnull()].drop(
+        columns=[col for col in df_customers.columns if col in merged_df.columns]
+    )
+
+    # Пытаемся найти дополнительные совпадения по названию контрагента и имени клиента. Используется левое объединение, чтобы сохранить все записи из unmatched_df, даже если совпадений не найдено. Суффиксы добавляются для различения одинаковых столбцов из двух DataFrame.
+    additional_matches = pd.merge(
+        unmatched_df,
+        df_customers,
+        left_on='Название контрагента',  # Столбец для объединения из документа
+        right_on='Имя',                   # Столбец для объединения из клиентов
+        how='left',                       # Левое объединение сохраняет все записи из unmatched_df
+        suffixes=('_doc', '_cust')        # Суффиксы для различения столбцов из разных DataFrame
+    )
+
+    # Объединяем уже совпавшие записи с дополнительными совпадениями в один итоговый DataFrame
+    final_merged_df = pd.concat([matched_df, additional_matches], ignore_index=True)
+else:
+    # Если отсутствующих ИНН нет, итоговый DataFrame равен исходному объединенному DataFrame
+    final_merged_df = merged_df
+
+# Подсчитываем общее количество записей без совпадений по ИНН после дополнительных попыток совпадения
+total_missing = final_merged_df['ID клиента'].isnull().sum()
+print(f"Общее количество записей без совпадений: {total_missing}")
+
+# Шаг 2: Предобработка данных
+# Удалим записи без совпадений
+clean_df = final_merged_df.dropna(subset=['ID клиента'])
+
+# Удаляем записи с пропусками в 'Сумма'
+clean_df = clean_df.dropna(subset=['Сумма'])
+
+# Выбор релевантных признаков
+# Исключим неинформативные признаки и идентификаторы
+features_to_drop = ['Номер документа', 'ID клиента', 'ИНН', 'ИНН контрагента', 'Email', 'Телефон', 'Адрес', 'Расчетный счет']
+
+X = clean_df.drop(columns=features_to_drop + ['Сумма'])
+y = clean_df['Сумма']
+
+# Обработка дат
+# Преобразуем 'Дата создания' в datetime и извлечем полезные компоненты
+X['Дата создания'] = pd.to_datetime(X['Дата создания'], errors='coerce')
+X['Year'] = X['Дата создания'].dt.year
+X['Month'] = X['Дата создания'].dt.month
+X['Day'] = X['Дата создания'].dt.day
+X['DayOfWeek'] = X['Дата создания'].dt.dayofweek
+X = X.drop('Дата создания', axis=1)
+
+# Обработка категориальных признаков
+categorical_cols = X.select_dtypes(include=['object']).columns.tolist()
+
+# Применяем One-Hot Encoding для кодирования категориальных признаков, т.е. их преобразования из нечисленных в численные
+X = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
+
+# Заполнение оставшихся пропусков, если они есть
+X = X.fillna(0)
+
+# Разделение на обучающую и тестовую выборки
+X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=42)
+
+# Преобразование всех данных в числовой формат
+X_train = X_train.apply(pd.to_numeric, errors='coerce').fillna(0)
+X_test = X_test.apply(pd.to_numeric, errors='coerce').fillna(0)
+
+# Убедимся, что все столбцы имеют одинаковые типы и порядок
+for col in X_train.columns:
+    if col not in X_test.columns:
+        X_test[col] = 0
+X_test = X_test[X_train.columns]
+
+# Обучение модели случайного леса
+model = RandomForestRegressor(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+# Выбор категориальных столбцов
+object_columns = X_train.select_dtypes(include=['object']).columns
+if len(object_columns) > 0:
+    # Инициализация OneHotEncoder
+    encoder = OneHotEncoder(drop='first', sparse=False, handle_unknown='ignore')
+    encoder.fit(X_train[object_columns])
+
+    # Преобразование обучающего набора
+    X_train_encoded = pd.concat(
+        [X_train.drop(columns=object_columns),
+         pd.DataFrame(encoder.transform(X_train[object_columns]),
+                      columns=encoder.get_feature_names_out(object_columns),
+                      index=X_train.index)],
+        axis=1
+    )
+
+    # Преобразование тестового набора
+    X_test_encoded = pd.concat(
+        [X_test.drop(columns=object_columns),
+         pd.DataFrame(encoder.transform(X_test[object_columns]),
+                      columns=encoder.get_feature_names_out(object_columns),
+                      index=X_test.index)],
+        axis=1
+    )
+else:
+    X_train_encoded = X_train.copy()
+    X_test_encoded = X_test.copy()
+
+X_train_encoded = X_train_encoded.astype(float)
+
+# Инициализация объекта SHAP с закодированными данными
+explainer = shap.Explainer(model, X_train_encoded)
+shap_values = explainer(X_test_encoded)
+
+# Визуализация важности признаков
+shap.summary_plot(shap_values, X_test_encoded, plot_type="bar")
