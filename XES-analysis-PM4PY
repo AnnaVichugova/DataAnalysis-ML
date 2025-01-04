@@ -1,0 +1,118 @@
+############################ ячейка 1 - установка и импорт модулей #######################
+!pip install pm4py pandas #установка библиотек pm4py и pandas
+import pm4py #импорт библиотеки pm4py для процессного майнинга
+import pandas as pd #импорт библиотеки pandas для работы с данными
+from pm4py.objects.log.obj import EventLog, Trace, Event #импорт классов EventLog, Trace и Event из pm4py для работы с логами событий
+from pm4py.objects.conversion.log import converter as log_converter #конвертер логов из pm4py для преобразования форматов логов
+from pm4py.objects.log.util import sorting #утилита сортировки событий в логах
+from pm4py.objects.log.exporter.xes import exporter as xes_exporter #экспортер логов в формате XES из pm4py
+from pm4py.objects.log.importer.xes import importer as xes_importer #импортер логов из формата XES из pm4py
+from pm4py.objects.petri_net.importer import importer #импортер сетей Петри из pm4py
+from pm4py.algo.filtering.log.variants import variants_filter #фильтр для вариантов логов из pm4py
+from pm4py.statistics.variants.log import get as variants_get #функция получения статистики вариантов логов
+from pm4py.algo.discovery.alpha.variants import plus as alpha_miner #алгоритм Alpha Miner для обнаружения сетей Петри
+from pm4py.algo.conformance.tokenreplay.variants import token_replay as token_replay #алгоритм Token Replay для проверки соответствия процессов
+import pprint #для удобного отображения структур данных 
+from google.colab import files #для работы с файлами в Google Colab 
+
+############################ ячейка 2 - визуализация событий из XES-файла #######################
+# Чтение XES лога
+log = pm4py.read_xes('/content/log.xes')
+
+# Визуализация плотности распределения событий по времени - график, показывающий, как часто происходят события в различные моменты времени
+pm4py.view_events_per_time_graph(log)
+
+# Визуализация распределения событий по дням недели
+pm4py.view_events_distribution_graph(log)
+
+# Визуализация распределения продолжительности кейсов - сколько времени в среднем занимает завершение кейса, полезно для анализа эффективности процессов
+pm4py.view_case_duration_graph(log)
+
+############################ ячейка 3 - построение сети Петри #######################
+# Загрузка журнала из файла log.xes
+log = xes_importer.apply('/content/log.xes')
+
+# Обнаружение сети Петри с помощью альфа-алгоритма
+net, initial_marking, final_marking = alpha_miner.apply(log)
+
+# Визуализация сети Петри
+pm4py.view_petri_net(net, initial_marking, final_marking)
+
+############################ ячейка 4 - построение BPMN-диаграммы #######################
+# Чтение XES лога
+log = pm4py.read_xes('/content/log.xes')
+
+# Обнаружение BPMN модели с использованием индуктивного метода на основе лога
+bpmn_model = pm4py.discover_bpmn_inductive(log)
+
+# Визуализация полученной BPMN модели
+pm4py.view_bpmn(bpmn_model)
+
+############################ ячейка 5 - конформный анализ BPMN-диаграммы vs сеть Петри #######################
+# Для читабельного и красивого вывода создаем экземпляр PrettyPrinter
+pp = pprint.PrettyPrinter(indent=4, width=120, sort_dicts=False)
+
+# Загрузка журнала из файла log.xes
+log = xes_importer.apply('/content/log.xes')
+
+# Обнаружение сети Петри с помощью альфа-алгоритма
+net, initial_marking, final_marking = alpha_miner.apply(log)
+
+# Визуализация сети Петри
+pm4py.view_petri_net(net, initial_marking, final_marking)
+
+# Проведение конформного анализа с использованием сети Петри
+replayed_traces = token_replay.apply(log, net, initial_marking, final_marking)
+
+# Анализ результатов
+for count,trace in enumerate(replayed_traces, start=1):
+    pp.pprint(f"Трейс {count}")
+    pp.pprint(trace)
+
+############################ ячейка 6 - построение DFG-дерева процесса #######################
+# Чтение XES лога
+log = pm4py.read_xes('/content/log.xes')
+
+# Обнаруживаем граф напрямую следующих событий (Directly-Follows Graph, DFG)
+# Метод discover_dfg возвращает три значения:
+# dfg: сам граф DFG, отображающий связи между активностями
+# start_activities: список начальных активностей процесса
+# end_activities: список конечных активностей процесса
+dfg, start_activities, end_activities = pm4py.discover_dfg(log)
+
+# Визуализация дерева процессов
+pm4py.view_dfg(dfg, start_activities, end_activities)
+
+# Выводим полученные результаты для проверки
+print("Directly-Follows Graph:", dfg)
+print("Начальные активности:", start_activities)
+print("Конечные активности:", end_activities)
+
+############################ ячейка 7 - построение эвристической сети процессов #######################
+# Чтение XES лога
+log = pm4py.read_xes('/content/log.xes')
+
+#обнаружение эвристической сети
+heuristic_net = pm4py.discover_heuristics_net(log)
+
+# Визуализация дерева процессов
+pm4py.view_heuristics_net(heuristic_net)
+
+# Текстовый вывод эвристической сети
+print(heuristic_net)
+
+############################ ячейка 8 - получение статистики по вариантам выполнения процессов #######################
+variant_stats = variants_get.get_variants(log)
+
+# Формирование списка допустимых вариантов
+admitted_variants = list(variant_stats.keys())
+
+# Фильтрация лога, сохраняя только допустимые варианты
+filtered_log = variants_filter.apply(log, admitted_variants)
+
+# Вывод количества вариантов
+print("Всего найдено допустимых вариантов процесса: ", len(admitted_variants))
+
+# Вывод вариантов с номерами
+for count, variant in enumerate(variant_stats.items(), start=1):
+    print(f"Вариант {count}: {variant}")
