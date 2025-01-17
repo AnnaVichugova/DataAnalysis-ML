@@ -28,7 +28,70 @@ pm4py.view_events_distribution_graph(log)
 # Визуализация распределения продолжительности кейсов - сколько времени в среднем занимает завершение кейса, полезно для анализа эффективности процессов
 pm4py.view_case_duration_graph(log)
 
-############################ ячейка 3 - построение сети Петри #######################
+############################ ячейка 3 - построение BPMN с комментариями #######################
+# Загрузка журнала из файла log.xes
+log = xes_importer.apply('/content/log.xes')
+
+# Функция для форматирования длительности
+def format_duration(minutes):
+    if minutes > 90:
+        days = minutes // (24 * 60)
+        minutes_rem = minutes % (24 * 60)
+        hours = minutes_rem // 60
+        minutes_final = minutes_rem % 60
+        parts = []
+        if days > 0:
+            parts.append(f"{int(days)} дн.")
+        if hours > 0:
+            parts.append(f"{int(hours)} ч.")
+        if minutes_final > 0:
+            parts.append(f"{int(minutes_final)} мин.")
+        return ' '.join(parts)
+    else:
+        return f"{round(minutes, 2)} мин"
+
+# Вычислим среднюю длительность каждого действия
+activity_durations = defaultdict(list)
+
+for trace in log:
+    for event in trace:
+        start_time = event.get('time:timestamp')
+        # есть отдельные атрибуты для начала и конца события
+        end_time = event.get('timestamp:end')
+        if end_time:
+            duration = (end_time - start_time).total_seconds() / 60  # в минутах
+            activity_durations[event['concept:name']].append(duration)
+
+average_durations = {activity: statistics.mean(durations) 
+                     for activity, durations in activity_durations.items()}
+
+# Определим исполнителей для каждого действия
+activity_performers = defaultdict(set)
+
+for trace in log:
+    for event in trace:
+        performer = event.get('concept:position', 'Неизвестно')
+        activity_performers[event['concept:name']].add(performer)
+
+# Дополняем названия действий
+for trace in log:
+    for event in trace:
+        activity = event['concept:name']
+        performers = ", ".join(activity_performers[activity])
+        avg_duration_minutes = average_durations[activity]
+        formatted_duration = format_duration(avg_duration_minutes)
+        # Обновляем название действия с форматированной длительностью
+        event['concept:name'] = (
+            f"Задача: {activity}\n\n"
+            f"Исполнитель: {performers}\n"
+            f"Средняя длительность: {formatted_duration}"
+        )
+
+# Создаем BPMN-модель и визуализируем её
+bpmn_model = pm4py.discover_bpmn_inductive(log)
+pm4py.view_bpmn(bpmn_model)
+
+############################ ячейка 4 - построение сети Петри #######################
 # Загрузка журнала из файла log.xes
 log = xes_importer.apply('/content/log.xes')
 
@@ -38,7 +101,7 @@ net, initial_marking, final_marking = alpha_miner.apply(log)
 # Визуализация сети Петри
 pm4py.view_petri_net(net, initial_marking, final_marking)
 
-############################ ячейка 4 - построение BPMN-диаграммы #######################
+############################ ячейка 5 - построение BPMN-диаграммы #######################
 # Загрузка журнала из файла log.xes
 log = xes_importer.apply('/content/log.xes')
 
@@ -48,7 +111,7 @@ bpmn_model = pm4py.discover_bpmn_inductive(log)
 # Визуализация полученной BPMN модели
 pm4py.view_bpmn(bpmn_model)
 
-############################ ячейка 5 - конформный анализ BPMN-диаграммы vs сеть Петри #######################
+############################ ячейка 6 - конформный анализ BPMN-диаграммы vs сеть Петри #######################
 # Для читабельного и красивого вывода создаем экземпляр PrettyPrinter
 pp = pprint.PrettyPrinter(indent=4, width=120, sort_dicts=False)
 
@@ -69,7 +132,7 @@ for count,trace in enumerate(replayed_traces, start=1):
     pp.pprint(f"Трейс {count}")
     pp.pprint(trace)
 
-############################ ячейка 6 - построение DFG-дерева процесса #######################
+############################ ячейка 7 - построение DFG-дерева процесса #######################
 # Загрузка журнала из файла log.xes
 log = xes_importer.apply('/content/log.xes')
 
@@ -88,7 +151,7 @@ print("Directly-Follows Graph:", dfg)
 print("Начальные активности:", start_activities)
 print("Конечные активности:", end_activities)
 
-############################ ячейка 7 - построение эвристической сети процессов #######################
+############################ ячейка 8 - построение эвристической сети процессов #######################
 # Загрузка журнала из файла log.xes
 log = xes_importer.apply('/content/log.xes')
 
@@ -101,7 +164,7 @@ pm4py.view_heuristics_net(heuristic_net)
 # Текстовый вывод эвристической сети
 print(heuristic_net)
 
-############################ ячейка 8 - получение статистики по вариантам выполнения процессов #######################
+############################ ячейка 9 - получение статистики по вариантам выполнения процессов #######################
 
 # Загрузка журнала из файла log.xes
 log = xes_importer.apply('/content/log.xes')
