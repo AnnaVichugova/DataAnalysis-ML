@@ -13,6 +13,8 @@ from pm4py.statistics.variants.log import get as variants_get #функция п
 from pm4py.algo.discovery.alpha.variants import plus as alpha_miner #алгоритм Alpha Miner для обнаружения сетей Петри
 from pm4py.algo.conformance.tokenreplay.variants import token_replay as token_replay #алгоритм Token Replay для проверки соответствия процессов
 import pprint #для удобного отображения структур данных 
+from collections import defaultdict #для создания подсловарей
+import statistics #для статистических вычислений
 from google.colab import files #для работы с файлами в Google Colab 
 
 ############################ ячейка 2 - визуализация событий из XES-файла #######################
