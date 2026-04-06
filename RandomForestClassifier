@@ -1,0 +1,575 @@
+############################ ячейка 1 - импорт модулей #######################
+from google.colab import files
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    roc_curve, mean_absolute_error, mean_squared_error, r2_score,
+    silhouette_score, davies_bouldin_score, adjusted_rand_score,
+    confusion_matrix, classification_report
+)
+import shap
+import re
+import warnings
+warnings.filterwarnings('ignore')
+
+import random
+from datetime import datetime
+
+############################ ячейка 2 - чтение CSV-файлов #######################
+df_applications = pd.read_csv('/content/applications.csv', sep=',', encoding='utf-8')
+df_customers = pd.read_csv('/content/customers.csv', sep=',', encoding='utf-8')
+df_managers = pd.read_csv('/content/managers.csv', sep=',', encoding='utf-8')
+df_documents = pd.read_csv('/content/documents.csv', sep=',', encoding='utf-8')
+df_contracts_content = pd.read_csv('/content/contracts_content.csv', sep=',', encoding='utf-8')
+df_products = pd.read_csv('/content/products.csv', sep=',', encoding='utf-8')
+df_providers = pd.read_csv('/content/providers.csv', sep=',', encoding='utf-8')
+df_payments = pd.read_csv('/content/payments.csv', sep=',', encoding='utf-8')
+
+############################ ячейка 3 - подготовка данных (объединение, очистка, кодирование) #######################
+
+# Шаг 1: Определяем целевую переменную (конверсию)
+def determine_conversion(status):
+    if status == 'завершена':
+        return 1
+    elif status in ['отменена', 'заморожена']:
+        return 0
+    else:
+        return np.nan
+
+df_applications['is_converted'] = df_applications['Статус'].apply(determine_conversion)
+
+# Шаг 2: Переименовываем столбцы для избежания конфликтов
+df_customers = df_customers.rename(columns={
+    'ID клиента': 'customer_id', 'Имя': 'customer_name', 'Тип': 'customer_type',
+    'Статус': 'customer_status', 'ИНН': 'customer_inn', 'Телефон': 'customer_phone',
+    'Email': 'customer_email', 'Адрес': 'customer_address', 'Банк': 'customer_bank',
+    'Расчетный счет': 'customer_account'
+})
+
+df_managers = df_managers.rename(columns={
+    'ID менеджера': 'manager_id', 'Имя': 'manager_name',
+    'Специализация': 'manager_specialization', 'Телефон': 'manager_phone',
+    'Email': 'manager_email'
+})
+
+# Шаг 3: Объединяем датафреймы по совпадающим столбцам
+merged_df = pd.merge(df_applications, df_customers, left_on='Клиент', right_on='customer_id', how='left')
+merged_df = pd.merge(merged_df, df_managers, left_on='Менеджер', right_on='manager_id', how='left')
+
+# Шаг 4: Создаем датафрейм с признаками и удаляем лишние строки и столбцы
+X = pd.DataFrame()
+X['is_converted'] = merged_df['is_converted']
+X['id_заявки'] = merged_df['Номер']
+
+# Отбираем нужные признаки
+X['Источник'] = merged_df['Источник'].fillna('unknown')
+X['Тип_клиента'] = merged_df['customer_type'].fillna('unknown')
+X['Статус_клиента'] = merged_df['customer_status'].fillna('unknown')
+X['Специализация_менеджера'] = merged_df['manager_specialization'].fillna('unknown')
+X['Менеджер'] = merged_df['manager_name'].fillna('unknown')
+
+# Извлекаем регион из адреса
+def extract_region(address):
+    if pd.isna(address):
+        return 'unknown'
+    parts = str(address).split(',')
+    return parts[0].strip() if len(parts) >= 1 else 'unknown'
+
+X['Регион'] = merged_df['customer_address'].apply(extract_region)
+
+# Извлекаем количество техники из текста заявки
+def extract_quantity(text):
+    if pd.isna(text):
+        return 0
+    match = re.search(r'в количестве (\d+)', str(text))
+    return int(match.group(1)) if match else 0
+
+X['Запрошенное_количество'] = merged_df['Содержание заявки'].apply(extract_quantity)
+X['Длина_заявки'] = merged_df['Содержание заявки'].fillna('').apply(len)
+X['Срочность'] = merged_df['Содержание заявки'].fillna('').apply(lambda x: 1 if 'сроч' in str(x).lower() else 0)
+
+# Дата
+if 'Дата поступления' in merged_df.columns:
+    X['Дата'] = pd.to_datetime(merged_df['Дата поступления'], errors='coerce')
+    X['День_недели'] = X['Дата'].dt.dayofweek
+    X['Месяц'] = X['Дата'].dt.month
+    X = X.drop('Дата', axis=1)
+
+# Удаляем строки с неопределенной конверсией (шаг 4 - удаление лишних строк)
+clean_df = X[X['is_converted'].notna()].copy()
+
+# Шаг 5: Кодируем категориальные признаки (One-Hot Encoding)
+y = clean_df['is_converted'].astype(int)
+X_features = clean_df.drop(['is_converted', 'id_заявки'], axis=1)
+
+categorical_cols = X_features.select_dtypes(include=['object']).columns.tolist()
+X_encoded = pd.get_dummies(X_features, columns=categorical_cols, drop_first=True)
+
+# Шаг 6: Заполняем пропуски
+X_encoded = X_encoded.fillna(0)
+
+print(f"Статусы заявок:\n{df_applications['Статус'].value_counts()}")
+print(f"\nДоля конверсий: {df_applications['is_converted'].dropna().mean():.2%}")
+print(f"После объединения: {len(merged_df)} записей")
+print(f"После удаления неопределенных: {len(clean_df)} записей")
+print(f"Конверсий: {clean_df['is_converted'].sum()}, Не конверсий: {len(clean_df) - clean_df['is_converted'].sum()}")
+print(f"Финальное количество признаков: {X_encoded.shape[1]}")
+
+############################ ячейка 4 - обучение модели и интерпретация #######################
+# Шаг 7: Разделение на обучающую и тестовую выборки
+X_train, X_test, y_train, y_test = train_test_split(
+    X_encoded, y, test_size=0.25, random_state=42, stratify=y
+)
+
+# Шаг 8: Обучение ML-модели
+model = RandomForestClassifier(
+    n_estimators=100, max_depth=10, min_samples_split=10,
+    min_samples_leaf=5, random_state=42, class_weight='balanced'
+)
+model.fit(X_train, y_train)
+
+# Шаг 10: Интерпретация результатов обучения (влияние признаков)
+feature_importance = pd.DataFrame({
+    'feature': X_train.columns,
+    'importance': model.feature_importances_
+}).sort_values('importance', ascending=False)
+
+print("="*60)
+print("🔍 ИНТЕРПРЕТАЦИЯ РЕЗУЛЬТАТОВ ОБУЧЕНИЯ")
+print("="*60)
+print("\nТоп-15 важнейших признаков (влияние на конверсию):")
+for i, row in feature_importance.head(15).iterrows():
+    print(f"  {row['feature']}: {row['importance']:.4f}")
+
+# Шаг 11: Визуализация интерпретации
+plt.figure(figsize=(10, 8))
+top_features = feature_importance.head(15)
+plt.barh(top_features['feature'], top_features['importance'])
+plt.xlabel('Важность признака')
+plt.title('Топ-15 факторов, влияющих на конверсию заявки')
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.show()
+
+print(f"\n Статистика по данным:")
+print(f"  Всего заявок: {len(df_applications)}")
+print(f"  Определенных (с известным исходом): {len(clean_df)}")
+print(f"  Доля конверсий: {y.mean():.2%}")
+
+############################ ячейка 5 - предсказание конверсии по конкретной заявке #######################
+
+print("="*60)
+print("ПРЕДСКАЗАНИЕ КОНВЕРСИИ ПО СЛУЧАЙНОЙ ЗАЯВКЕ")
+print("="*60)
+
+# Улучшенная функция извлечения количества (ищет ЛЮБЫЕ числа)
+def extract_quantity_improved(text):
+    if pd.isna(text):
+        return 0
+    match = re.search(r'(\d+)', str(text))
+    if match:
+        return int(match.group(1))
+    return 0
+
+# Генерация случайных данных
+
+# 1. Случайный номер заявки
+random_num = random.randint(1, 999)
+day = datetime.now().day
+month = datetime.now().month
+year = datetime.now().year
+new_application_number = f"{random_num:03d}-{day:02d}-{month:02d}-{year}"
+
+# 2. Случайный клиент из df_customers
+if len(df_customers) > 0:
+    random_client = df_customers['customer_id'].sample(n=1).iloc[0]
+else:
+    random_client = f"customer-{random.randint(1, 10000)}"
+
+# 3. Случайный менеджер из df_managers
+if len(df_managers) > 0:
+    random_manager = df_managers['manager_id'].sample(n=1).iloc[0]
+else:
+    random_manager = f"manager-{random.randint(1, 30)}"
+
+# 4. Случайный источник
+sources = ['сайт', 'телефон', 'мессенджер', 'email']
+random_source = random.choice(sources)
+
+# 5. Случайный текст заявки (шаблоны с числами)
+templates = [
+    'Нужен {техника} в количестве {количество}',
+    'Требуется {техника} {количество} штуки, срочно!',
+    'Интересует {техника} для строительства, нужно {количество} шт',
+    'Хочу заказать {техника} - {количество} единиц',
+    'Подберите {техника} по хорошей цене, планирую купить {количество} шт',
+    'Срочно! Необходим {техника} в количестве {количество}',
+    'Заявка на {техника} {количество} шт для стройки'
+]
+
+techniques = ['экскаватор', 'погрузчик', 'бульдозер', 'кран', 'грейдер', 'трактор', 'самосвал']
+quantities = ['1', '2', '3', '5', '10', '15', '20']
+
+random_template = random.choice(templates)
+random_technique = random.choice(techniques)
+random_quantity = random.choice(quantities)
+
+random_content = random_template.format(техника=random_technique, количество=random_quantity)
+
+# Добавляем "срочно" с вероятностью 50%
+if random.random() < 0.5:
+    if "срочно" not in random_content.lower():
+        random_content += " Срочно!"
+
+# 6. Случайный статус
+statuses = ['новая', 'назначена', 'принята', 'в работе']
+random_status = random.choice(statuses)
+
+# 7. Текущая дата
+current_date = datetime.now().strftime('%Y-%m-%d')
+
+# Формируем заявку
+new_application = {
+    'Номер': new_application_number,
+    'Клиент': random_client,
+    'Источник': random_source,
+    'Содержание заявки': random_content,
+    'Статус': random_status,
+    'Менеджер': random_manager,
+    'Дата поступления': current_date
+}
+
+print("\nСгенерированная заявка:")
+print(f"  Номер заявки: {new_application['Номер']}")
+print(f"  Клиент: {new_application['Клиент']}")
+print(f"  Источник: {new_application['Источник']}")
+print(f"  Содержание: {new_application['Содержание заявки']}")
+print(f"  Менеджер: {new_application['Менеджер']}")
+print(f"  Дата поступления: {new_application['Дата поступления']}")
+
+# Получаем и выводим данные клиента
+customer_data = df_customers[df_customers['customer_id'] == new_application['Клиент']]
+if len(customer_data) > 0:
+    customer_info = customer_data.iloc[0]
+    print(f"\nДанные клиента:")
+    print(f"  ФИО (для ФЛ) или название (для ЮЛ): {customer_info['customer_name']}")
+    print(f"  Тип: {customer_info['customer_type']}")
+    print(f"  Статус: {customer_info['customer_status']}")
+    print(f"  ИНН: {customer_info['customer_inn']}")
+    print(f"  Телефон: {customer_info['customer_phone']}")
+    print(f"  Email: {customer_info['customer_email']}")
+    print(f"  Адрес: {customer_info['customer_address']}")
+    print(f"  Регион: {extract_region(customer_info['customer_address'])}")
+else:
+    print(f"\nКлиент {new_application['Клиент']} не найден в базе")
+    customer_info = None
+
+# Получаем и выводим данные менеджера
+manager_data = df_managers[df_managers['manager_id'] == new_application['Менеджер']]
+if len(manager_data) > 0:
+    manager_info = manager_data.iloc[0]
+    print(f"\nДанные менеджера:")
+    print(f"  Имя: {manager_info['manager_name']}")
+    print(f"  Специализация: {manager_info['manager_specialization']}")
+    print(f"  Телефон: {manager_info['manager_phone']}")
+    print(f"  Email: {manager_info['manager_email']}")
+else:
+    print(f"\nМенеджер {new_application['Менеджер']} не найден в базе")
+    manager_info = None
+
+# Формируем признаки для предсказания
+def prepare_features_for_prediction(app, customer, manager):
+    features = {}
+    
+    features['Источник'] = app['Источник']
+    features['Тип_клиента'] = customer['customer_type'] if customer is not None else 'unknown'
+    features['Статус_клиента'] = customer['customer_status'] if customer is not None else 'unknown'
+    
+    if customer is not None:
+        features['Регион'] = extract_region(customer['customer_address'])
+    else:
+        features['Регион'] = 'unknown'
+    
+    features['Специализация_менеджера'] = manager['manager_specialization'] if manager is not None else 'unknown'
+    features['Менеджер'] = manager['manager_name'] if manager is not None else 'unknown'
+    
+    features['Запрошенное_количество'] = extract_quantity_improved(app['Содержание заявки'])
+    features['Длина_заявки'] = len(app['Содержание заявки'])
+    features['Срочность'] = 1 if 'сроч' in app['Содержание заявки'].lower() else 0
+    
+    date = pd.to_datetime(app['Дата поступления'], errors='coerce')
+    features['День_недели'] = date.dayofweek
+    features['Месяц'] = date.month
+    
+    return features
+
+features_dict = prepare_features_for_prediction(new_application, customer_info, manager_info)
+
+print("\nПризнаки для модели:")
+for key, value in features_dict.items():
+    print(f"  {key}: {value}")
+
+days_map = {0: 'Понедельник', 1: 'Вторник', 2: 'Среда', 3: 'Четверг', 4: 'Пятница', 5: 'Суббота', 6: 'Воскресенье'}
+print(f"  День_недели: {features_dict['День_недели']} ({days_map[features_dict['День_недели']]})")
+
+features_df = pd.DataFrame([features_dict])
+features_encoded = pd.get_dummies(features_df, drop_first=True)
+
+missing_cols = set(X_train.columns) - set(features_encoded.columns)
+for col in missing_cols:
+    features_encoded[col] = 0
+
+features_encoded = features_encoded[X_train.columns]
+features_encoded = features_encoded.fillna(0)
+
+prediction_prob = model.predict_proba(features_encoded)[0, 1]
+prediction_class = model.predict(features_encoded)[0]
+
+print("\n" + "="*60)
+print("РЕЗУЛЬТАТ ПРЕДСКАЗАНИЯ")
+print("="*60)
+print(f"\nВероятность конверсии: {prediction_prob:.2%}")
+print(f"Предсказанный класс: {'Конверсия' if prediction_class == 1 else 'Не конверсия'}")
+
+print("\nИнтерпретация:")
+if prediction_prob >= 0.7:
+    print("🔥  ВЫСОКАЯ вероятность конверсии (>70%)")
+    print("  Рекомендация: обработать заявку в первую очередь")
+    print("  Отправить КП в течение 2-4 часов")
+elif prediction_prob >= 0.4:
+    print("🟡  СРЕДНЯЯ вероятность конверсии (40-70%)")
+    print("  Рекомендация: обработать в обычном порядке")
+    print("  Отправить КП в течение 24 часов")
+else:
+    print("❌  НИЗКАЯ вероятность конверсии (<40%)")
+    print("  Рекомендация: проанализировать причины")
+
+############################ ячейка 6 - метрики качества машинного обучения #######################
+
+# Шаг 9: Проверка ML-модели на тестовом наборе
+y_pred = model.predict(X_test)
+y_pred_proba = model.predict_proba(X_test)[:, 1]
+
+print("="*60)
+print("МЕТРИКИ КАЧЕСТВА МАШИННОГО ОБУЧЕНИЯ")
+print("="*60)
+
+# ============================================================
+# 1. МЕТРИКИ ДЛЯ ЗАДАЧ КЛАССИФИКАЦИИ
+# ============================================================
+print("\n" + "-"*60)
+print("МЕТРИКИ КЛАССИФИКАЦИИ")
+print("-"*60)
+
+# Accuracy (доля верных ответов)
+acc = accuracy_score(y_test, y_pred)
+print(f"\nAccuracy (доля верных ответов): {acc:.4f}")
+print(f"  → Доля правильно предсказанных примеров от общего числа: {acc*100:.1f}%")
+
+# Error Rate (доля ошибок)
+error_rate = 1 - acc
+print(f"\nError Rate (доля ошибок): {error_rate:.4f}")
+print(f"  → Доля неправильно предсказанных примеров: {error_rate*100:.1f}%")
+
+# Precision (точность)
+prec = precision_score(y_test, y_pred)
+print(f"\nPrecision (точность): {prec:.4f}")
+print(f"  → Из всех предсказанных конверсий верных: {prec*100:.1f}%")
+
+# Recall (полнота)
+rec = recall_score(y_test, y_pred)
+print(f"\nRecall (полнота): {rec:.4f}")
+print(f"  → Из всех реальных конверсий модель нашла: {rec*100:.1f}%")
+
+# F1-score
+f1 = f1_score(y_test, y_pred)
+print(f"\nF1-score: {f1:.4f}")
+print(f"  → Гармоническое среднее Precision и Recall")
+
+# AUC-ROC
+auc = roc_auc_score(y_test, y_pred_proba)
+print(f"\nAUC-ROC: {auc:.4f}")
+print(f"  → Способность модели различать классы: ", end="")
+if auc > 0.9:
+    print("отличное")
+elif auc > 0.8:
+    print("очень хорошее")
+elif auc > 0.7:
+    print("хорошее")
+elif auc > 0.6:
+    print("среднее")
+else:
+    print("низкое")
+
+# ============================================================
+# 2. ROC-КРИВАЯ (график)
+# ============================================================
+print("\n" + "-"*60)
+print("ROC-КРИВАЯ")
+print("-"*60)
+
+fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
+
+plt.figure(figsize=(8, 6))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC-кривая (AUC = {auc:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Случайный классификатор')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate (1 - Специфичность)')
+plt.ylabel('True Positive Rate (Чувствительность)')
+plt.title('ROC-кривая')
+plt.legend(loc="lower right")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 3. ДОПОЛНИТЕЛЬНЫЕ МЕТРИКИ
+# ============================================================
+print("\n" + "-"*60)
+print("ДОПОЛНИТЕЛЬНЫЕ МЕТРИКИ (для регрессии, если целевая переменная числовая)")
+print("-"*60)
+
+# MAE - Средняя абсолютная ошибка
+mae = mean_absolute_error(y_test, y_pred_proba)
+print(f"\nMAE (средняя абсолютная ошибка): {mae:.4f}")
+print(f"  → Среднее отклонение предсказанной вероятности от фактического класса")
+
+# MSE - Средняя квадратичная ошибка
+mse = mean_squared_error(y_test, y_pred_proba)
+print(f"\nMSE (средняя квадратичная ошибка): {mse:.4f}")
+print(f"  → Штрафует за большие отклонения")
+
+# RMSE - корень из MSE
+rmse = np.sqrt(mse)
+print(f"\nRMSE: {rmse:.4f}")
+
+# ============================================================
+# 4. МЕТРИКИ ДЛЯ КЛАСТЕРИЗАЦИИ (если нужно оценить кластеризацию)
+# ============================================================
+print("\n" + "-"*60)
+print("МЕТРИКИ КЛАСТЕРИЗАЦИИ (оценка группировки данных)")
+print("-"*60)
+
+# Для демонстрации используем предсказанные вероятности как признак
+# (в реальном сценарии нужно использовать результаты кластеризации)
+try:
+    # Преобразуем данные для кластеризационных метрик
+    X_sample = X_test.sample(min(500, len(X_test)), random_state=42)
+    y_sample = y_test.loc[X_sample.index]
+    
+    # Силуэтный коэффициент (чем выше, тем лучше)
+    # Для расчета нужны сами данные и метки кластеров
+    # Используем предсказанные классы как кластеры
+    sil_score = silhouette_score(X_sample, y_sample)
+    print(f"\nSilhouette Score: {sil_score:.4f}")
+    print(f"  → Насколько объекты похожи на объекты внутри своего кластера")
+    print(f"    (диапазон от -1 до 1, чем выше, тем лучше)")
+    
+    # Индекс Дэвиса-Болдина (чем ниже, тем лучше)
+    db_score = davies_bouldin_score(X_sample, y_sample)
+    print(f"\nDavies-Bouldin Index: {db_score:.4f}")
+    print(f"  → Средняя 'похожесть' между кластером и его соседом")
+    print(f"    (чем меньше, тем лучше разделение кластеров)")
+    
+    # Adjusted Rand Index (сравнение с истинными метками)
+    ari_score = adjusted_rand_score(y_sample, y_pred[X_sample.index])
+    print(f"\nAdjusted Rand Index (ARI): {ari_score:.4f}")
+    print(f"  → Сравнение полученного разбиения с истинными метками")
+    print(f"    (1 = идеальное совпадение, 0 = случайное)")
+    
+except Exception as e:
+    print(f"\n  Примечание: метрики кластеризации не рассчитаны")
+    print(f"  ({str(e)[:100]})")
+
+# ============================================================
+# 5. CLASSIFICATION REPORT
+# ============================================================
+print("\n" + "-"*60)
+print("CLASSIFICATION REPORT (детальный отчет)")
+print("-"*60)
+print(classification_report(y_test, y_pred, target_names=['Не конверсия', 'Конверсия']))
+
+# ============================================================
+# 6. CONFUSION MATRIX
+# ============================================================
+print("\n" + "-"*60)
+print("CONFUSION MATRIX (матрица ошибок)")
+print("-"*60)
+cm = confusion_matrix(y_test, y_pred)
+cm_df = pd.DataFrame(cm, 
+                     index=['Реально: Не конверсия', 'Реально: Конверсия'], 
+                     columns=['Предсказано: Не конверсия', 'Предсказано: Конверсия'])
+print(cm_df)
+
+# Визуализация матрицы ошибок
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# Абсолютные значения
+axes[0].imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+axes[0].set_title('Матрица ошибок (абсолютные значения)')
+axes[0].set_xticks([0, 1])
+axes[0].set_xticklabels(['Не конверсия', 'Конверсия'])
+axes[0].set_yticks([0, 1])
+axes[0].set_yticklabels(['Не конверсия', 'Конверсия'])
+axes[0].set_ylabel('Истинное значение')
+axes[0].set_xlabel('Предсказанное значение')
+for i in range(2):
+    for j in range(2):
+        axes[0].text(j, i, str(cm[i, j]), ha='center', va='center', color='red')
+
+# Нормализованные значения (в процентах)
+cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+axes[1].imshow(cm_norm, interpolation='nearest', cmap=plt.cm.Greens)
+axes[1].set_title('Матрица ошибок (нормализованная, %)')
+axes[1].set_xticks([0, 1])
+axes[1].set_xticklabels(['Не конверсия', 'Конверсия'])
+axes[1].set_yticks([0, 1])
+axes[1].set_yticklabels(['Не конверсия', 'Конверсия'])
+axes[1].set_ylabel('Истинное значение')
+axes[1].set_xlabel('Предсказанное значение')
+for i in range(2):
+    for j in range(2):
+        axes[1].text(j, i, f'{cm_norm[i, j]*100:.1f}%', ha='center', va='center', color='darkblue')
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 7. СВОДНАЯ ТАБЛИЦА МЕТРИК
+# ============================================================
+print("\n" + "-"*60)
+print("СВОДНАЯ ТАБЛИЦА МЕТРИК")
+print("-"*60)
+
+summary_metrics = pd.DataFrame({
+    'Метрика': ['Accuracy', 'Error Rate', 'Precision', 'Recall', 'F1-score', 'AUC-ROC', 'MAE', 'MSE', 'RMSE'],
+    'Значение': [acc, error_rate, prec, rec, f1, auc, mae, mse, rmse],
+    'Описание': [
+        'Доля верных ответов',
+        'Доля ошибок',
+        'Точность предсказания конверсии',
+        'Полнота (доля найденных конверсий)',
+        'Гармоническое среднее Precision и Recall',
+        'Способность различать классы',
+        'Средняя абсолютная ошибка',
+        'Средняя квадратичная ошибка',
+        'Корень из MSE'
+    ]
+})
+print(summary_metrics.to_string(index=False))
+
+print("\n" + "="*60)
+print("ВЫВОДЫ ПО МЕТРИКАМ")
+print("="*60)
+print(f"""
+  • Модель правильно предсказывает {acc*100:.1f}% случаев
+  • Точность предсказания конверсии: {prec*100:.1f}%
+  • Модель находит {rec*100:.1f}% всех реальных конверсий
+  • AUC-ROC = {auc:.4f} — {'отличное' if auc > 0.8 else 'хорошее' if auc > 0.7 else 'среднее'} качество
+  • Ошибка MAE = {mae:.4f} — среднее отклонение вероятности
+""")
