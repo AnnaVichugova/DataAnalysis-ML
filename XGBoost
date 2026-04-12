@@ -1,0 +1,815 @@
+############################ ячейка 1 - установка библиотек и импорт модулей #######################
+!pip install pandas numpy scikit-learn matplotlib seaborn xgboost shap imbalanced-learn
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+import random
+from datetime import datetime
+
+# Scikit-learn для классификации
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    roc_curve, confusion_matrix
+)
+from sklearn.preprocessing import LabelEncoder
+from sklearn.feature_selection import SelectKBest, f_classif
+from imblearn.over_sampling import SMOTE
+import xgboost as xgb
+import shap
+
+warnings.filterwarnings('ignore')
+
+############################ ячейка 2 - чтение CSV-файлов #######################
+df_applications = pd.read_csv('/content/applications.csv', sep=',', encoding='utf-8')
+df_customers = pd.read_csv('/content/customers.csv', sep=',', encoding='utf-8')
+df_managers = pd.read_csv('/content/managers.csv', sep=',', encoding='utf-8')
+
+# Переименование признаков
+df_customers = df_customers.rename(columns={
+    'ID клиента': 'customer_id',
+    'Имя': 'customer_name',
+    'Тип': 'customer_type',
+    'Статус': 'customer_status',
+    'ИНН': 'customer_inn',
+    'Телефон': 'customer_phone',
+    'Email': 'customer_email',
+    'Адрес': 'customer_address'
+})
+
+df_managers = df_managers.rename(columns={
+    'ID менеджера': 'manager_id',
+    'Имя': 'manager_name',
+    'Специализация': 'manager_specialization'
+})
+
+############################ ячейка 3 - фича-инжиниринг: подготовка признаков для ML-модели #######################
+# ---- Извлечение техники из текста заявок ----
+def extract_equipment_type(text):
+    if pd.isna(text):
+        return 'unknown'
+    text = str(text)
+    equipment_map = {
+        'Ресайклер': 'Дорожная', 'Демаркировщик': 'Дорожная', 'Грейдер': 'Дорожная',
+        'Каток': 'Дорожная', 'Асфальтоукладчик': 'Дорожная', 'Дорожная фреза': 'Дорожная',
+        'Разметочная машина': 'Дорожная', 'Бетономешалка': 'Строительная', 'Экскаватор': 'Строительная',
+        'Бульдозер': 'Строительная', 'Сваебой': 'Строительная', 'Бур': 'Строительная',
+        'Вибропогружатель': 'Строительная', 'Кран': 'Грузоподъемная', 'Погрузчик': 'Грузоподъемная',
+        'Автолифт': 'Грузоподъемная', 'Автовышка': 'Грузоподъемная', 'Манипулятор': 'Грузоподъемная',
+        'Подъемная площадка': 'Грузоподъемная', 'Стационарный кран': 'Грузоподъемная',
+        'Автомобильный кран': 'Грузоподъемная', 'Самосвал': 'Транспортная', 'Трал': 'Транспортная',
+        'Автопоезд': 'Транспортная', 'Бункеровоз': 'Транспортная', 'Бортовой грузовик': 'Транспортная',
+        'Цистерна': 'Транспортная', 'Фура': 'Транспортная', 'Низкорамник': 'Транспортная',
+        'Разбрасыватель реагентов': 'Коммунальная', 'Ассенизатор': 'Коммунальная',
+        'Снегоуборщик': 'Коммунальная', 'Моечная техника': 'Коммунальная',
+        'Поливальная машина': 'Коммунальная', 'Мусоровоз': 'Коммунальная',
+        'Трактор': 'Сельскохозяйственная', 'Опрыскиватель': 'Сельскохозяйственная',
+        'Комбайн': 'Сельскохозяйственная', 'Кормоуборщик': 'Сельскохозяйственная',
+        'Жатка': 'Сельскохозяйственная', 'Сеялка': 'Сельскохозяйственная',
+        'Харвестер': 'Лесозаготовительная', 'Форвардер': 'Лесозаготовительная',
+        'Трелёвочный трактор': 'Лесозаготовительная', 'Лесовоз': 'Лесозаготовительная',
+        'Измельчитель': 'Лесозаготовительная', 'Скиддер': 'Лесозаготовительная',
+        'Валочно-пакетирующая техника': 'Лесозаготовительная',
+        'Шахтная машина': 'Горнодобывающая', 'Буровая мачта': 'Горнодобывающая',
+        'Карьерная грузовая техника': 'Горнодобывающая', 'Забойная машина': 'Горнодобывающая',
+        'Копровая установка': 'Горнодобывающая', 'Дробильная машина': 'Горнодобывающая',
+    }
+    for equip, category in equipment_map.items():
+        if equip.lower() in text.lower():
+            return category
+    return 'other'
+
+def extract_urgency(text):
+    if pd.isna(text):
+        return 0
+    text = str(text).lower()
+    urgency_words = ['срочно', 'срочная', 'срочный', 'горящая', 'немедленно', 'сегодня', 'завтра']
+    return 1 if any(word in text for word in urgency_words) else 0
+
+def extract_politeness(text):
+    if pd.isna(text):
+        return 0
+    text = str(text).lower()
+    polite_words = ['здравствуйте', 'пожалуйста', 'спасибо', 'благодарю', 'добрый день', 'извините']
+    return sum(1 for word in polite_words if word in text)
+
+def extract_quantity(text):
+    if pd.isna(text):
+        return 1
+    import re
+    text = str(text)
+    numbers = re.findall(r'\d+', text)
+    return int(numbers[0]) if numbers else 1
+
+# ---- ФУНКЦИИ ДЛЯ РАСЧЕТА ИСТОРИИ И РЕГИОНА ----
+def get_customer_history(customer_id):
+    customer_apps = df_applications[df_applications['Клиент'] == customer_id]
+    total_apps = len(customer_apps)
+    successful_apps = len(customer_apps[customer_apps['Статус'] == 'завершена'])
+    conversion_rate = successful_apps / total_apps if total_apps > 0 else 0
+    return {'total_applications': total_apps, 'successful_applications': successful_apps, 'conversion_rate': conversion_rate}
+
+def get_manager_history(manager_id):
+    manager_apps = df_applications[df_applications['Менеджер'] == manager_id]
+    total_handled = len(manager_apps)
+    successful_handled = len(manager_apps[manager_apps['Статус'] == 'завершена'])
+    conversion_rate = successful_handled / total_handled if total_handled > 0 else 0
+    return {'total_handled': total_handled, 'manager_conversion_rate': conversion_rate}
+
+def extract_region(address):
+    if pd.isna(address):
+        return 'не указан'
+    address = str(address)
+    if 'москв' in address.lower() or 'moscow' in address.lower():
+        return 'Москва'
+    elif 'спб' in address.lower() or 'санкт' in address.lower() or 'петербург' in address.lower():
+        return 'Санкт-Петербург'
+    else:
+        return 'Регионы'
+
+# ---- ПРЕДВАРИТЕЛЬНЫЕ РАСЧЕТЫ ----
+print("  Расчет истории клиентов...")
+customer_history = {}
+for customer_id in df_applications['Клиент'].unique():
+    customer_apps = df_applications[df_applications['Клиент'] == customer_id]
+    total_apps = len(customer_apps)
+    successful_apps = len(customer_apps[customer_apps['Статус'] == 'завершена'])
+    customer_history[customer_id] = {
+        'total_applications': total_apps,
+        'successful_applications': successful_apps,
+        'conversion_rate': successful_apps / total_apps if total_apps > 0 else 0
+    }
+
+print("  Расчет истории менеджеров...")
+manager_history = {}
+for manager_id in df_applications['Менеджер'].unique():
+    manager_apps = df_applications[df_applications['Менеджер'] == manager_id]
+    total_handled = len(manager_apps)
+    successful_handled = len(manager_apps[manager_apps['Статус'] == 'завершена'])
+    manager_history[manager_id] = {
+        'total_handled': total_handled,
+        'manager_conversion_rate': successful_handled / total_handled if total_handled > 0 else 0
+    }
+
+# ---- СОЗДАЕМ СЛОВАРИ ДЛЯ БЫСТРОГО ДОСТУПА ----
+print("  Подготовка справочников...")
+customer_dict = df_customers.set_index('customer_id').to_dict('index')
+manager_dict = df_managers.set_index('manager_id')['manager_specialization'].to_dict()
+
+# ---- БЫСТРОЕ ФОРМИРОВАНИЕ ПРИЗНАКОВ ----
+print("  Формирование признаков...")
+df_features = df_applications.copy()
+
+df_features['customer_type'] = df_features['Клиент'].map(lambda x: customer_dict.get(x, {}).get('customer_type', 'unknown'))
+df_features['customer_status'] = df_features['Клиент'].map(lambda x: customer_dict.get(x, {}).get('customer_status', 'unknown'))
+df_features['total_applications'] = df_features['Клиент'].map(lambda x: customer_history.get(x, {}).get('total_applications', 0))
+df_features['successful_applications'] = df_features['Клиент'].map(lambda x: customer_history.get(x, {}).get('successful_applications', 0))
+df_features['conversion_rate'] = df_features['Клиент'].map(lambda x: customer_history.get(x, {}).get('conversion_rate', 0))
+df_features['total_handled'] = df_features['Менеджер'].map(lambda x: manager_history.get(x, {}).get('total_handled', 0))
+df_features['manager_conversion_rate'] = df_features['Менеджер'].map(lambda x: manager_history.get(x, {}).get('manager_conversion_rate', 0))
+df_features['manager_specialization'] = df_features['Менеджер'].map(lambda x: manager_dict.get(x, 'unknown'))
+
+print("  Извлечение признаков из текста...")
+df_features['equipment_category'] = df_features['Содержание заявки'].apply(extract_equipment_type)
+df_features['urgency'] = df_features['Содержание заявки'].apply(extract_urgency)
+df_features['politeness_score'] = df_features['Содержание заявки'].apply(extract_politeness)
+df_features['request_quantity'] = df_features['Содержание заявки'].apply(extract_quantity)
+
+print("  Добавление временных признаков...")
+df_features['Дата поступления'] = pd.to_datetime(df_features['Дата поступления'], errors='coerce')
+df_features['hour'] = df_features['Дата поступления'].dt.hour.fillna(12).astype(int)
+df_features['day_of_week'] = df_features['Дата поступления'].dt.dayofweek.fillna(0).astype(int)
+df_features['is_weekend'] = (df_features['day_of_week'] >= 5).astype(int)
+df_features['days_since_start'] = (df_features['Дата поступления'] - pd.Timestamp('2024-01-01')).dt.days.fillna(0).astype(int)
+
+df_features['target'] = (df_features['Статус'] == 'завершена').astype(int)
+
+keep_cols = ['Источник', 'customer_type', 'customer_status', 'manager_specialization',
+             'equipment_category', 'urgency', 'politeness_score', 'request_quantity',
+             'total_applications', 'successful_applications', 'conversion_rate',
+             'total_handled', 'manager_conversion_rate', 'hour', 'day_of_week',
+             'is_weekend', 'days_since_start', 'target']
+
+df_features = df_features[keep_cols]
+
+print(f"\n✅ Сформировано {len(df_features)} записей")
+print(f"\nЦелевая переменная (конверсия):")
+print(df_features['target'].value_counts())
+print(f"  Конверсий: {df_features['target'].sum()} ({df_features['target'].mean()*100:.1f}%)")
+
+# ---- КОДИРОВАНИЕ КАТЕГОРИАЛЬНЫХ ПРИЗНАКОВ ----
+print("\n  Кодирование категориальных признаков...")
+categorical_cols = ['Источник', 'customer_type', 'customer_status', 'manager_specialization', 'equipment_category']
+label_encoders = {}
+
+for col in categorical_cols:
+    le = LabelEncoder()
+    df_features[col] = df_features[col].fillna('unknown').astype(str)
+    df_features[col + '_encoded'] = le.fit_transform(df_features[col])
+    label_encoders[col] = le
+    df_features = df_features.drop(columns=[col])
+
+# ---- ПОДГОТОВКА X и y ----
+feature_cols = [col for col in df_features.columns if col != 'target']
+X = df_features[feature_cols]
+y = df_features['target']
+
+feature_names_ru = {
+    'Источник_encoded': 'Источник заявки',
+    'customer_type_encoded': 'Тип клиента',
+    'customer_status_encoded': 'Статус клиента',
+    'manager_specialization_encoded': 'Специализация менеджера',
+    'equipment_category_encoded': 'Категория техники',
+    'urgency': 'Срочность заявки',
+    'politeness_score': 'Вежливость заявки',
+    'request_quantity': 'Запрошенное количество',
+    'total_applications': 'Всего заявок клиента',
+    'successful_applications': 'Успешных заявок клиента',
+    'conversion_rate': 'Конверсия клиента',
+    'total_handled': 'Заявок у менеджера',
+    'manager_conversion_rate': 'Конверсия менеджера',
+    'hour': 'Час поступления',
+    'day_of_week': 'День недели',
+    'is_weekend': 'Выходной день',
+    'days_since_start': 'Дней с начала периода'
+}
+
+print(f"\n✅ Размерность X: {X.shape}")
+print(f"✅ Количество признаков: {len(feature_cols)}")
+print(f"\n✅ Функции get_customer_history, get_manager_history, extract_region добавлены")
+
+############################ ячейка 4 - обучение с балансировкой классов #######################
+
+# Разделение на train/test
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, random_state=42, stratify=y
+)
+
+# --- ПРИМЕНЯЕМ SMOTE ДЛЯ БАЛАНСИРОВКИ КЛАССОВ ---
+smote = SMOTE(random_state=42, k_neighbors=min(5, y_train.value_counts().min() - 1))
+X_train_balanced, y_train_balanced = smote.fit_resample(X_train, y_train)
+
+print(f"До SMOTE: {y_train.value_counts().to_dict()}")
+print(f"После SMOTE: {pd.Series(y_train_balanced).value_counts().to_dict()}")
+
+# --- ОТБОР ПРИЗНАКОВ (оставляем топ-15 лучших) ---
+selector = SelectKBest(f_classif, k=min(15, X.shape[1]))
+X_train_selected = selector.fit_transform(X_train_balanced, y_train_balanced)
+X_test_selected = selector.transform(X_test)
+
+# Получаем названия отобранных признаков
+selected_features = X.columns[selector.get_support()].tolist()
+selected_features_ru = [feature_names_ru.get(f, f) for f in selected_features]
+
+print(f"\n✅ Отобранные признаки ({len(selected_features)}):")
+for eng, ru in zip(selected_features, selected_features_ru):
+    print(f"   • {ru} ({eng})")
+
+# --- ОБУЧАЕМ XGBOOST ---
+model = xgb.XGBClassifier(
+    n_estimators=200,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    scale_pos_weight=len(y_train_balanced[y_train_balanced==0]) / len(y_train_balanced[y_train_balanced==1]),
+    random_state=42,
+    eval_metric='auc',
+    use_label_encoder=False
+)
+
+model.fit(
+    X_train_selected, y_train_balanced,
+    eval_set=[(X_test_selected, y_test)],
+    verbose=False
+)
+
+# Предсказания
+y_pred = model.predict(X_test_selected)
+y_pred_proba = model.predict_proba(X_test_selected)[:, 1]
+
+# ============================================================
+# 1. МЕТРИКИ КАЧЕСТВА МОДЕЛИ
+# ============================================================
+print("\n" + "="*70)
+print("📊 МЕТРИКИ КАЧЕСТВА МОДЕЛИ")
+print("="*70)
+
+auc = roc_auc_score(y_test, y_pred_proba)
+acc = accuracy_score(y_test, y_pred)
+prec = precision_score(y_test, y_pred)
+rec = recall_score(y_test, y_pred)
+f1 = f1_score(y_test, y_pred)
+
+print(f"\n  AUC-ROC: {auc:.4f}  {'✅ Отлично' if auc > 0.75 else '✅ Хорошо' if auc > 0.7 else '⚠️ Средне'}")
+print(f"  Accuracy: {acc:.4f}  (доля верных ответов)")
+print(f"  Precision: {prec:.4f} (точность предсказания конверсии)")
+print(f"  Recall: {rec:.4f}    (полнота - нашли {rec*100:.1f}% всех конверсий)")
+print(f"  F1-score: {f1:.4f}   (гармоническое среднее)")
+
+# ============================================================
+# 2. ROC-КРИВАЯ
+# ============================================================
+print("\n" + "="*70)
+print("📈 ROC-КРИВАЯ")
+print("="*70)
+
+fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
+
+plt.figure(figsize=(10, 8))
+plt.plot(fpr, tpr, color='darkorange', lw=3, label=f'XGBoost (AUC = {auc:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Случайный классификатор (AUC = 0.5)')
+plt.fill_between(fpr, tpr, alpha=0.3, color='orange')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('Доля ложных срабатываний (False Positive Rate)', fontsize=12)
+plt.ylabel('Доля верных обнаружений (True Positive Rate)', fontsize=12)
+plt.title('ROC-кривая: качество модели предсказания конверсии', fontsize=14, fontweight='bold')
+plt.legend(loc="lower right", fontsize=11)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 3. МАТРИЦА ОШИБОК (Confusion Matrix)
+# ============================================================
+print("\n" + "="*70)
+print("📊 МАТРИЦА ОШИБОК")
+print("="*70)
+
+cm = confusion_matrix(y_test, y_pred)
+cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Абсолютные значения
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0],
+            xticklabels=['Не конверсия', 'Конверсия'],
+            yticklabels=['Не конверсия', 'Конверсия'])
+axes[0].set_title('Матрица ошибок (абсолютные значения)', fontsize=12, fontweight='bold')
+axes[0].set_ylabel('Истинное значение', fontsize=11)
+axes[0].set_xlabel('Предсказанное значение', fontsize=11)
+
+# Нормализованные значения (%)
+sns.heatmap(cm_norm, annot=True, fmt='.1%', cmap='Greens', ax=axes[1],
+            xticklabels=['Не конверсия', 'Конверсия'],
+            yticklabels=['Не конверсия', 'Конверсия'])
+axes[1].set_title('Матрица ошибок (нормализованная, %)', fontsize=12, fontweight='bold')
+axes[1].set_ylabel('Истинное значение', fontsize=11)
+axes[1].set_xlabel('Предсказанное значение', fontsize=11)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 4. ВАЖНОСТЬ ПРИЗНАКОВ
+# ============================================================
+print("\n" + "="*70)
+print("🎯 ВАЖНОСТЬ ПРИЗНАКОВ")
+print("="*70)
+
+feature_importance = pd.DataFrame({
+    'feature_eng': selected_features,
+    'feature_ru': selected_features_ru,
+    'importance': model.feature_importances_
+}).sort_values('importance', ascending=False)
+
+print("\n  Топ-10 самых важных признаков для модели:")
+for i, row in feature_importance.head(10).iterrows():
+    bar = "█" * int(row['importance'] * 50)
+    print(f"  {row['feature_ru']:<30} {row['importance']:.4f}  {bar}")
+
+# Визуализация важности признаков
+fig, ax = plt.subplots(figsize=(12, 8))
+top_features = feature_importance.head(12)
+colors = plt.cm.RdYlGn_r(np.linspace(0.2, 0.8, len(top_features)))
+
+bars = ax.barh(range(len(top_features)), top_features['importance'].values, color=colors, alpha=0.8)
+ax.set_yticks(range(len(top_features)))
+ax.set_yticklabels(top_features['feature_ru'].values, fontsize=10)
+ax.set_xlabel('Важность признака (вклад в модель)', fontsize=12)
+ax.set_title('Глобальная важность признаков в модели XGBoost', fontsize=14, fontweight='bold')
+ax.invert_yaxis()
+
+# Добавляем значения на бары
+for i, (idx, row) in enumerate(top_features.iterrows()):
+    ax.text(row['importance'] + 0.002, i, f'{row["importance"]:.3f}', va='center', fontsize=9)
+
+plt.tight_layout()
+plt.show()
+
+print("\n✅ Модель обучена и готова к использованию!")
+print(f"✅ Сохранены объекты: model, selector, label_encoders, selected_features, feature_names_ru")
+
+############################ ячейка 5 - прогноз конверсии по конкретной заявке #######################
+
+print("="*80)
+print(" ПРОГНОЗ КОНВЕРСИИ ПО НОВОЙ ЗАЯВКЕ")
+print("="*80)
+
+# --- ГЕНЕРАЦИЯ СЛУЧАЙНОЙ ЗАЯВКИ ---
+random_num = random.randint(1, 999)
+day = datetime.now().day
+month = datetime.now().month
+year = datetime.now().year
+new_application_number = f"{random_num:03d}-{day:02d}-{month:02d}-{year}"
+
+if len(df_customers) > 0:
+    random_client = df_customers['customer_id'].sample(n=1).iloc[0]
+else:
+    random_client = f"customer-{random.randint(1, 10000)}"
+
+if len(df_managers) > 0:
+    random_manager = df_managers['manager_id'].sample(n=1).iloc[0]
+else:
+    random_manager = f"manager-{random.randint(1, 30)}"
+
+sources = ['сайт', 'телефон', 'мессенджер', 'email']
+random_source = random.choice(sources)
+
+templates = [
+    'Нужен {техника} в количестве {количество}',
+    'Требуется {техника} {количество} штуки, срочно!',
+    'Интересует {техника} для строительства, нужно {количество} шт',
+    'Хочу заказать {техника} - {количество} единиц',
+    'Подберите {техника} по хорошей цене, планирую купить {количество} шт',
+    'Срочно! Необходим {техника} в количестве {количество}',
+    'Заявка на {техника} {количество} шт для стройки'
+]
+
+techniques = ['экскаватор', 'погрузчик', 'бульдозер', 'кран', 'грейдер', 'трактор', 'самосвал']
+quantities = ['1', '2', '3', '5', '10', '15', '20']
+
+random_template = random.choice(templates)
+random_technique = random.choice(techniques)
+random_quantity = random.choice(quantities)
+
+random_content = random_template.format(техника=random_technique, количество=random_quantity)
+
+if random.random() < 0.5 and "срочно" not in random_content.lower():
+    random_content += " Срочно!"
+
+statuses = ['новая', 'назначена', 'принята', 'в работе']
+random_status = random.choice(statuses)
+current_date = datetime.now().strftime('%Y-%m-%d')
+
+new_application = {
+    'Номер': new_application_number,
+    'Клиент': random_client,
+    'Источник': random_source,
+    'Содержание заявки': random_content,
+    'Статус': random_status,
+    'Менеджер': random_manager,
+    'Дата поступления': current_date
+}
+
+print("\n СГЕНЕРИРОВАННАЯ ЗАЯВКА")
+print("─" * 50)
+print(f"  Номер:     {new_application['Номер']}")
+print(f"  Клиент:    {new_application['Клиент']}")
+print(f"  Источник:  {new_application['Источник']}")
+print(f"  Содержание: {new_application['Содержание заявки'][:80]}...")
+print(f"  Менеджер:  {new_application['Менеджер']}")
+print(f"  Дата:      {new_application['Дата поступления']}")
+
+# --- ПОЛУЧАЕМ ДАННЫЕ КЛИЕНТА ---
+customer_data = df_customers[df_customers['customer_id'] == new_application['Клиент']]
+if len(customer_data) > 0:
+    customer_info = customer_data.iloc[0]
+    print(f"\n ДАННЫЕ КЛИЕНТА")
+    print("─" * 50)
+    print(f"   Название:    {customer_info['customer_name']}")
+    print(f"   Тип:         {customer_info['customer_type']}")
+    print(f"   Статус:      {customer_info['customer_status']}")
+    print(f"   ИНН:         {customer_info['customer_inn']}")
+    print(f"   Телефон:     {customer_info['customer_phone']}")
+    print(f"   Email:       {customer_info['customer_email']}")
+else:
+    print(f"\n⚠️ Клиент {new_application['Клиент']} не найден в базе")
+    customer_info = None
+
+# --- ПОЛУЧАЕМ ДАННЫЕ МЕНЕДЖЕРА ---
+manager_data = df_managers[df_managers['manager_id'] == new_application['Менеджер']]
+if len(manager_data) > 0:
+    manager_info = manager_data.iloc[0]
+    print(f"\n ДАННЫЕ МЕНЕДЖЕРА")
+    print("─" * 50)
+    print(f"   Имя:            {manager_info['manager_name']}")
+    print(f"   Специализация:  {manager_info['manager_specialization']}")
+else:
+    print(f"\n⚠️ Менеджер {new_application['Менеджер']} не найден в базе")
+    manager_info = None
+
+# --- РАСЧЕТ ИСТОРИЧЕСКИХ ПРИЗНАКОВ ---
+customer_hist = get_customer_history(new_application['Клиент'])
+manager_hist = get_manager_history(new_application['Менеджер'])
+
+# --- ФОРМИРУЕМ ПРИЗНАКИ ДЛЯ МОДЕЛИ ---
+date = pd.to_datetime(new_application['Дата поступления'], errors='coerce')
+
+features = {
+    'Источник': new_application['Источник'],
+    'customer_type': customer_info['customer_type'] if customer_info is not None else 'unknown',
+    'customer_status': customer_info['customer_status'] if customer_info is not None else 'unknown',
+    'manager_specialization': manager_info['manager_specialization'] if manager_info is not None else 'unknown',
+    'equipment_category': extract_equipment_type(new_application['Содержание заявки']),
+    'urgency': extract_urgency(new_application['Содержание заявки']),
+    'politeness_score': extract_politeness(new_application['Содержание заявки']),
+    'request_quantity': extract_quantity(new_application['Содержание заявки']),
+    'total_applications': customer_hist['total_applications'],
+    'successful_applications': customer_hist['successful_applications'],
+    'conversion_rate': customer_hist['conversion_rate'],
+    'total_handled': manager_hist['total_handled'],
+    'manager_conversion_rate': manager_hist['manager_conversion_rate'],
+    'hour': date.hour if not pd.isna(date) else 12,
+    'day_of_week': date.dayofweek if not pd.isna(date) else 0,
+    'is_weekend': 1 if (date.dayofweek >= 5 and not pd.isna(date)) else 0,
+    'days_since_start': (date - pd.Timestamp('2024-01-01')).days if not pd.isna(date) else 0,
+}
+
+print("\n ПРИЗНАКИ ДЛЯ МОДЕЛИ")
+print("─" * 50)
+for key, value in features.items():
+    ru_name = feature_names_ru.get(key, key)
+    if key in ['conversion_rate', 'manager_conversion_rate']:
+        print(f"  • {ru_name:<22}: {value:.1%}")
+    else:
+        print(f"  • {ru_name:<22}: {value}")
+
+# --- КОДИРОВАНИЕ ПРИЗНАКОВ ---
+features_df = pd.DataFrame([features])
+
+# Создаем словарь для хранения закодированных значений
+encoded_features = {}
+
+# Кодируем категориальные признаки
+for col in categorical_cols:
+    if col in features_df.columns:
+        val = features_df[col].iloc[0]
+        if val not in label_encoders[col].classes_:
+            val = 'unknown'
+            if 'unknown' not in label_encoders[col].classes_:
+                label_encoders[col].classes_ = np.append(label_encoders[col].classes_, 'unknown')
+        encoded_col = col + '_encoded'
+        encoded_features[encoded_col] = label_encoders[col].transform([val])[0]
+
+# Добавляем все остальные признаки (числовые)
+for col in features_df.columns:
+    if col not in categorical_cols:
+        encoded_features[col] = features_df[col].iloc[0]
+
+# Создаем DataFrame с закодированными признаками
+encoded_df = pd.DataFrame([encoded_features])
+
+# Выбираем только те признаки, которые были отобраны при обучении
+features_selected = encoded_df[selected_features]
+
+print(f"\n✅ Формирование признаков завершено")
+print(f"   Количество признаков: {features_selected.shape[1]} (должно быть {len(selected_features)})")
+
+# --- ПРЕДСКАЗАНИЕ ---
+prediction_prob = model.predict_proba(features_selected)[0, 1]
+prediction_class = model.predict(features_selected)[0]
+
+# --- ВЫВОД РЕЗУЛЬТАТОВ ---
+print("\n" + "="*80)
+print(" РЕЗУЛЬТАТ ПРЕДСКАЗАНИЯ")
+print("="*80)
+
+# Визуальный индикатор вероятности
+bar_length = 40
+filled = int(prediction_prob * bar_length)
+bar = "█" * filled + "░" * (bar_length - filled)
+
+print(f"\n   ВЕРОЯТНОСТЬ КОНВЕРСИИ: [{bar}] {prediction_prob:.1%}")
+print(f"\n   ПРЕДСКАЗАННЫЙ КЛАСС:   {'✅ КОНВЕРСИЯ' if prediction_class == 1 else '❌ НЕ КОНВЕРСИЯ'}")
+
+# Цветная индикация
+if prediction_prob >= 0.7:
+    status_icon = "🟢"
+    status_text = "ВЫСОКАЯ"
+    color_code = "\033[92m"
+elif prediction_prob >= 0.4:
+    status_icon = "🟡"
+    status_text = "СРЕДНЯЯ"
+    color_code = "\033[93m"
+else:
+    status_icon = "🔴"
+    status_text = "НИЗКАЯ"
+    color_code = "\033[91m"
+
+print(f"\n  {status_icon} СТАТУС: {color_code}{status_text} ВЕРОЯТНОСТЬ КОНВЕРСИИ\033[0m")
+
+# Детальные рекомендации
+print("\n" + "─" * 50)
+print("📌 РЕКОМЕНДАЦИИ ПО ОБРАБОТКЕ")
+print("─" * 50)
+
+if prediction_prob >= 0.7:
+    print("  🔥 ПРИОРИТЕТ: САМЫЙ ВЫСОКИЙ")
+    print("   Отправить КП: в течение 2-4 часов")
+    print("   Назначить: лучшего менеджера")
+    print("   Стратегия: персональная скидка, звонок в день обращения")
+    print("   Ожидаемая конверсия: >70%")
+
+elif prediction_prob >= 0.4:
+    print("  🟡 ПРИОРИТЕТ: СРЕДНИЙ")
+    print("   Отправить КП: в течение 24 часов")
+    print("   Назначить: штатного менеджера")
+    print("   Стратегия: стандартная обработка, обзвон через 3 дня")
+    print("   Ожидаемая конверсия: 40-70%")
+
+else:
+    print("  🔵 ПРИОРИТЕТ: НИЗКИЙ")
+    print("   Отправить КП: автоматически в течение 3 дней")
+    print("   Назначить: младшего менеджера")
+    print("   Стратегия: автоматическая рассылка, реактивация через 2 недели")
+    print("   Ожидаемая конверсия: <40%")
+
+# --- SHAP АНАЛИЗ ---
+print("\n" + "="*80)
+print("🔍 АНАЛИЗ ФАКТОРОВ, ПОВЛИЯВШИХ НА РЕШЕНИЕ")
+print("="*80)
+
+try:
+    if 'explainer' not in dir():
+        explainer = shap.TreeExplainer(model)
+
+    shap_values = explainer.shap_values(features_selected)
+    shap_values_for_pred = shap_values[1] if isinstance(shap_values, list) else shap_values
+
+    # Собираем данные
+    feature_effects = []
+    for i, feature_eng in enumerate(selected_features):
+        effect = shap_values_for_pred[0][i]
+        feature_ru = feature_names_ru.get(feature_eng, feature_eng)
+        original_value = features_selected.iloc[0, i]
+
+        # Декодируем категориальные признаки для отображения
+        decoded_value = original_value
+        for col in categorical_cols:
+            encoded_col = col + '_encoded'
+            if feature_eng == encoded_col:
+                try:
+                    decoded_value = label_encoders[col].inverse_transform([int(original_value)])[0]
+                except:
+                    decoded_value = original_value
+                break
+
+        feature_effects.append({
+            'feature_ru': feature_ru,
+            'feature_eng': feature_eng,
+            'value': decoded_value,
+            'shap_value': effect,
+            'abs_effect': abs(effect),
+            'direction': 'положительное' if effect > 0 else 'отрицательное'
+        })
+
+    feature_effects.sort(key=lambda x: x['abs_effect'], reverse=True)
+
+    # Таблица влияния
+    print("\n  📊 ВЛИЯНИЕ ПРИЗНАКОВ (от большего к меньшему)")
+    print("  " + "─" * 70)
+    print(f"  {'№':<3} {'Признак':<32} {'Значение':>15} {'Влияние':>12} {'Эффект':>8}")
+    print("  " + "─" * 70)
+
+    for idx, f in enumerate(feature_effects[:8], 1):
+        if isinstance(f['value'], float):
+            if f['feature_eng'] in ['conversion_rate', 'manager_conversion_rate']:
+                value_str = f"{f['value']:.1%}"
+            else:
+                value_str = f"{f['value']:.2f}"
+        else:
+            value_str = str(f['value'])
+
+        effect_sign = "+" if f['shap_value'] > 0 else ""
+        arrow = "💹" if f['shap_value'] > 0 else "🔻"
+        print(f"  {idx:<3} {f['feature_ru']:<32} {value_str:>15} {effect_sign}{f['shap_value']:>+.4f}   {arrow}")
+
+    # Детальная интерпретация
+    print("\n   ДЕТАЛЬНАЯ ИНТЕРПРЕТАЦИЯ ФАКТОРОВ")
+    print("  " + "─" * 70)
+
+    for f in feature_effects[:5]:
+        print(f"\n  🔹 {f['feature_ru']}")
+
+        if f['feature_eng'] == 'conversion_rate':
+            if f['shap_value'] > 0:
+                print(f"     • Значение: {f['value']:.1%} → это ХОРОШО")
+                print(f"     • Клиент с такой историей успешно завершает {f['value']:.0%} своих заявок")
+                print(f"     • Это СИЛЬНО повышает шансы на конверсию данной заявки")
+            else:
+                print(f"     • Значение: {f['value']:.1%} → это ПЛОХО")
+                print(f"     • Клиент редко доводит заявки до конца (только {f['value']:.0%} успешных)")
+                print(f"     • Это СИЛЬНО снижает шансы на конверсию")
+
+        elif f['feature_eng'] == 'manager_conversion_rate':
+            if f['shap_value'] > 0:
+                print(f"     • Конверсия менеджера: {f['value']:.1%} → ОПЫТНЫЙ менеджер")
+                print(f"     • Менеджер успешно завершает {f['value']:.0%} своих заявок")
+                print(f"     • Это повышает вероятность успеха")
+            else:
+                print(f"     • Конверсия менеджера: {f['value']:.1%} → НУЖНО ДООБУЧЕНИЕ")
+                print(f"     • Менеджер завершает только {f['value']:.0%} своих заявок")
+                print(f"     • Это снижает шансы на конверсию")
+
+        elif f['feature_eng'] == 'urgency':
+            if f['value'] == 1:
+                print(f"     • Заявка СРОЧНАЯ → это ХОРОШИЙ признак")
+                print(f"     • Срочные заявки конвертируются на 15-20% лучше обычных")
+                print(f"     • Клиент имеет реальную и немедленную потребность")
+            else:
+                print(f"     • Заявка НЕ СРОЧНАЯ")
+                print(f"     • Клиент может рассматривать альтернативы или отложить решение")
+
+        elif f['feature_eng'] == 'request_quantity':
+            if f['shap_value'] > 0:
+                print(f"     • Запрошено {f['value']} единиц → КРУПНЫЙ заказ")
+                print(f"     • Крупные заказы конвертируются лучше (серьезные клиенты)")
+            else:
+                print(f"     • Запрошено {f['value']} единиц → МЕЛКИЙ заказ")
+                print(f"     • Мелкие заказы конвертируются хуже")
+
+        elif f['feature_eng'] == 'is_weekend':
+            if f['value'] == 1:
+                print(f"     • Заявка поступила в ВЫХОДНОЙ день → это МИНУС")
+                print(f"     • В выходные сложнее дозвониться до ответственных лиц")
+            else:
+                print(f"     • Заявка поступила в БУДНИЙ день → это ПЛЮС")
+                print(f"     • Выше шанс оперативной обработки и принятия решения")
+
+        elif f['feature_eng'] == 'customer_status_encoded':
+            print(f"     • Статус клиента: {f['value']}")
+            if f['shap_value'] > 0:
+                print(f"     • ПОСТОЯННЫЙ клиент → повышает шансы")
+            else:
+                print(f"     • НОВЫЙ клиент → снижает шансы")
+
+        elif f['feature_eng'] == 'Источник_encoded':
+            print(f"     • Источник заявки: {f['value']}")
+            if f['value'] in ['телефон', 'сайт']:
+                print(f"     • Это ХОРОШИЙ канал с высокой конверсией")
+            else:
+                print(f"     • Конверсия из этого канала обычно ниже среднего")
+
+        else:
+            print(f"     • Значение: {f['value']}")
+            print(f"     • Этот фактор {'повышает' if f['shap_value'] > 0 else 'понижает'} вероятность конверсии на {abs(f['shap_value'])*100:.1f}%")
+
+    # ИТОГОВОЕ РЕЗЮМЕ
+    print("\n" + "="*80)
+    print("🎯 ИТОГОВОЕ РЕЗЮМЕ")
+    print("="*80)
+
+    positive_factors = [f for f in feature_effects[:5] if f['shap_value'] > 0]
+    negative_factors = [f for f in feature_effects[:5] if f['shap_value'] < 0]
+
+    print(f"\n  ✅ ФАКТОРЫ, ПОВЫШАЮЩИЕ ШАНСЫ КОНВЕРСИИ ЗАЯВКИ В ДОГОВОР ({len(positive_factors)}):")
+    for f in positive_factors[:3]:
+        print(f"     • {f['feature_ru']} ({f['value']})")
+
+    print(f"\n  ❌ ФАКТОРЫ, ПОНИЖАЮЩИЕ ШАНСЫ КОНВЕРСИИ ЗАЯВКИ В ДОГОВОР ({len(negative_factors)}):")
+    for f in negative_factors[:3]:
+        print(f"     • {f['feature_ru']} ({f['value']})")
+
+    # Вычисление потенциала улучшения
+    if prediction_prob < 0.5 and negative_factors:
+        print(f"\n  💡 ПОТЕНЦИАЛ УЛУЧШЕНИЯ:")
+        print(f"     • Если улучшить ключевые негативные факторы,")
+        print(f"     • вероятность конверсии может вырасти на 15-30%")
+
+    # График влияния
+    print("\n  📊 ГРАФИК ВЛИЯНИЯ ПРИЗНАКОВ:")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    top_effects = feature_effects[:8]
+    colors = ['#2ecc71' if e['shap_value'] > 0 else '#e74c3c' for e in top_effects]
+
+    ax.barh(range(len(top_effects)), [e['shap_value'] for e in top_effects], color=colors, alpha=0.8)
+    ax.set_yticks(range(len(top_effects)))
+    ax.set_yticklabels([e['feature_ru'] for e in top_effects], fontsize=10)
+    ax.set_xlabel('Влияние на вероятность конверсии', fontsize=11)
+    ax.set_title('Влияние признаков на предсказание для данной заявки', fontsize=12, fontweight='bold')
+    ax.axvline(x=0, color='black', linestyle='-', linewidth=0.5)
+    ax.invert_yaxis()
+
+    for i, e in enumerate(top_effects):
+        ax.text(e['shap_value'] + (0.01 if e['shap_value'] > 0 else -0.04),
+                i, f'{e["shap_value"]:+.3f}', va='center', fontsize=9)
+
+    legend_elements = [Patch(facecolor='#2ecc71', label='Увеличивает вероятность конверсии'),
+                       Patch(facecolor='#e74c3c', label='Уменьшает вероятность конверсии')]
+    ax.legend(handles=legend_elements, loc='lower right')
+
+    plt.tight_layout()
+    plt.show()
+
+except Exception as e:
+    print(f"\n  ⚠️ Детальный анализ не выполнен: {str(e)[:100]}")
+
+print("\n" + "="*80)
+print("✅ ПРОГНОЗИРОВАНИЕ ВЫПОЛНЕНО")
+print("="*80)
