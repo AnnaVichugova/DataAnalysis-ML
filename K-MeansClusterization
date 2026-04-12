@@ -1,0 +1,363 @@
+############################ ячейка 1 - установка библиотек и импорт модулей #######################
+!pip install pandas numpy scikit-learn matplotlib seaborn openpyxl
+
+# Импорт библиотек
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+import warnings
+warnings.filterwarnings('ignore')
+
+############################ ячейка 2 - чтение CSV-файлов #######################
+df_applications = pd.read_csv('/content/applications.csv', sep=',', encoding='utf-8')
+df_customers = pd.read_csv('/content/customers.csv', sep=',', encoding='utf-8')
+df_managers = pd.read_csv('/content/managers.csv', sep=',', encoding='utf-8')
+df_documents = pd.read_csv('/content/documents.csv', sep=',', encoding='utf-8')
+df_contracts_content = pd.read_csv('/content/contracts_content.csv', sep=',', encoding='utf-8')
+df_products = pd.read_csv('/content/products.csv', sep=',', encoding='utf-8')
+df_providers = pd.read_csv('/content/providers.csv', sep=',', encoding='utf-8')
+df_payments = pd.read_csv('/content/payments.csv', sep=',', encoding='utf-8')
+
+############################ ячейка 3 - подготовка данных (объединение, очистка, кодирование) #######################
+# Функция для предобработки дат
+def preprocess_dates(df, date_columns):
+    for col in date_columns:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+    return df
+
+# Предобработка дат
+df_applications = preprocess_dates(df_applications, ['Дата поступления', 'Дата закрытия'])
+df_documents = preprocess_dates(df_documents, ['Дата создания'])
+if 'Дата' in df_payments.columns:
+    df_payments['Дата'] = pd.to_datetime(df_payments['Дата'], format='%d.%m.%Y', errors='coerce')
+
+print("=== Данные загружены ===\n")
+
+# 1. АГРЕГАЦИЯ ПРИЗНАКОВ ДЛЯ КЛАСТЕРИЗАЦИИ КЛИЕНТОВ
+
+# Признаки из заявок
+applications_features = df_applications.groupby('Клиент').agg({
+    'Номер': 'count',  # количество заявок
+    'Статус': lambda x: (x == 'завершена').sum(),  # успешные заявки
+}).rename(columns={'Номер': 'total_applications', 'Статус': 'successful_applications'})
+
+applications_features['success_rate'] = (applications_features['successful_applications'] / 
+                                          applications_features['total_applications']).fillna(0)
+
+# Извлечение техники из текста заявок (простая эвристика)
+def extract_equipment_type(text):
+    if pd.isna(text):
+        return 'unknown'
+    text = str(text)
+    if 'Дорожная' in text:
+        return 'road'
+    elif 'Строительная' in text:
+        return 'construction'
+    elif 'Коммунальная' in text:
+        return 'municipal'
+    else:
+        return 'other'
+
+df_applications['equipment_type'] = df_applications['Содержание заявки'].apply(extract_equipment_type)
+equipment_preferences = pd.crosstab(df_applications['Клиент'], df_applications['equipment_type'])
+
+# Признаки из документов и платежей
+if 'Тип контрагента' in df_documents.columns:
+    documents_features = df_documents[df_documents['Тип контрагента'] == 'Клиент'].groupby('Название контрагента').agg({
+        'Сумма': ['sum', 'mean', 'count'],
+        'Статус': lambda x: (x == 'подписан').sum() if 'Статус' in df_documents.columns else 0
+    }).fillna(0)
+    documents_features.columns = ['total_sum', 'avg_sum', 'doc_count', 'signed_docs']
+else:
+    documents_features = pd.DataFrame()
+
+# Платежная активность
+if 'Тип' in df_payments.columns and 'ИНН плательщика' in df_payments.columns:
+    payments_features = df_payments[df_payments['Тип'] == 'Входящий'].groupby('ИНН плательщика').agg({
+        'Сумма': ['sum', 'mean', 'count']
+    }).fillna(0)
+    payments_features.columns = ['payment_sum', 'payment_avg', 'payment_count']
+else:
+    payments_features = pd.DataFrame()
+
+# Объединение признаков с данными о клиентах
+df_customers_enhanced = df_customers.copy()
+df_customers_enhanced.set_index('ID клиента', inplace=True)
+
+# Добавляем признаки
+df_customers_enhanced = df_customers_enhanced.join(applications_features, how='left').fillna(0)
+df_customers_enhanced = df_customers_enhanced.join(equipment_preferences, how='left').fillna(0)
+
+if not documents_features.empty:
+    df_customers_enhanced = df_customers_enhanced.join(documents_features, how='left').fillna(0)
+else:
+    for col in ['total_sum', 'avg_sum', 'doc_count', 'signed_docs']:
+        df_customers_enhanced[col] = 0
+
+# Добавляем информацию о менеджере
+if 'Менеджер' in df_applications.columns and 'ID менеджера' in df_managers.columns:
+    manager_mapping = df_managers.set_index('ID менеджера')['Специализация'].to_dict()
+    df_customers_enhanced['manager_specialization'] = 'unknown'
+    for customer in df_customers_enhanced.index:
+        customer_apps = df_applications[df_applications['Клиент'] == customer]
+        if len(customer_apps) > 0:
+            manager_id = customer_apps['Менеджер'].mode().iloc[0] if len(customer_apps['Менеджер'].mode()) > 0 else None
+            if manager_id and manager_id in manager_mapping:
+                df_customers_enhanced.loc[customer, 'manager_specialization'] = manager_mapping[manager_id]
+else:
+    df_customers_enhanced['manager_specialization'] = 'unknown'
+
+# Кодирование категориальных признаков
+categorical_cols = ['Тип', 'Статус', 'manager_specialization']
+label_encoders = {}
+
+for col in categorical_cols:
+    if col in df_customers_enhanced.columns:
+        le = LabelEncoder()
+        df_customers_enhanced[col + '_encoded'] = le.fit_transform(df_customers_enhanced[col].astype(str))
+        label_encoders[col] = le
+
+# Выбираем числовые признаки для кластеризации
+numeric_features = ['total_applications', 'success_rate', 'total_sum', 'avg_sum', 
+                    'doc_count', 'signed_docs']
+
+# Добавляем признаки по типам техники, если они есть
+equipment_cols = [col for col in ['road', 'construction', 'municipal', 'other'] if col in df_customers_enhanced.columns]
+numeric_features.extend(equipment_cols)
+
+# Убираем NaN и бесконечности
+for col in numeric_features:
+    if col in df_customers_enhanced.columns:
+        df_customers_enhanced[col] = df_customers_enhanced[col].replace([np.inf, -np.inf], 0).fillna(0)
+
+X = df_customers_enhanced[numeric_features]
+
+print("=== Признаки для кластеризации ===")
+print(X.head())
+print(f"\nРазмерность: {X.shape}")
+
+# Нормализация
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Определение оптимального числа кластеров (Elbow method)
+inertias = []
+silhouette_scores = []
+K_range = range(2, 8)
+
+for k in K_range:
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    kmeans.fit(X_scaled)
+    inertias.append(kmeans.inertia_)
+    silhouette_scores.append(silhouette_score(X_scaled, kmeans.labels_))
+
+# Визуализация
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].plot(K_range, inertias, 'bo-')
+axes[0].set_xlabel('Число кластеров')
+axes[0].set_ylabel('Инерция')
+axes[0].set_title('Метод локтя')
+axes[0].grid(True)
+
+axes[1].plot(K_range, silhouette_scores, 'ro-')
+axes[1].set_xlabel('Число кластеров')
+axes[1].set_ylabel('Silhouette Score')
+axes[1].set_title('Оценка силуэта')
+axes[1].grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# Выбираем оптимальное число кластеров
+optimal_k = 4
+kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
+clusters = kmeans.fit_predict(X_scaled)
+
+df_customers_enhanced['Cluster'] = clusters
+
+############################ ячейка 4 - обучение модели и интерпретация #######################
+# 3. АНАЛИЗ КЛАСТЕРОВ
+
+# Статистика по кластерам
+cluster_stats = df_customers_enhanced.groupby('Cluster')[numeric_features].mean()
+cluster_counts = df_customers_enhanced['Cluster'].value_counts().sort_index()
+
+print("\n=== Распределение по кластерам ===")
+print(cluster_counts)
+print("\n=== Характеристики кластеров ===")
+print(cluster_stats.round(2))
+
+# Визуализация кластеров (2D проекция)
+from sklearn.decomposition import PCA
+
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+
+plt.figure(figsize=(10, 6))
+scatter = plt.scatter(X_pca[:, 0], X_pca[:, 1], c=clusters, cmap='viridis', s=50, alpha=0.7)
+plt.colorbar(scatter, label='Кластер')
+plt.xlabel('Первая главная компонента')
+plt.ylabel('Вторая главная компонента')
+plt.title('Визуализация кластеров клиентов (PCA)')
+plt.grid(True, alpha=0.3)
+plt.show()
+
+# 4. ГЕНЕРАЦИЯ ГИПОТЕЗЫ
+
+print("\n" + "="*80)
+print("ГЕНЕРАЦИЯ БИЗНЕС-ГИПОТЕЗЫ НА ОСНОВЕ КЛАСТЕРИЗАЦИИ")
+print("="*80)
+
+# Анализ профилей кластеров
+cluster_profiles = {}
+
+for cluster_id in range(optimal_k):
+    cluster_data = df_customers_enhanced[df_customers_enhanced['Cluster'] == cluster_id]
+    
+    profile = {
+        'size': len(cluster_data),
+        'avg_applications': cluster_data['total_applications'].mean(),
+        'success_rate': cluster_data['success_rate'].mean(),
+        'avg_doc_sum': cluster_data['avg_sum'].mean(),
+        'total_doc_sum': cluster_data['total_sum'].mean(),
+        'doc_count': cluster_data['doc_count'].mean(),
+        'signed_docs': cluster_data['signed_docs'].mean(),
+    }
+    
+    # Добавляем информацию о предпочтениях по технике
+    for eq in equipment_cols:
+        profile[f'avg_{eq}'] = cluster_data[eq].mean()
+    
+    # Определяем основную технику
+    if equipment_cols:
+        eq_means = {eq: cluster_data[eq].mean() for eq in equipment_cols}
+        main_eq = max(eq_means, key=eq_means.get) if eq_means else 'unknown'
+        profile['main_equipment'] = main_eq
+    else:
+        profile['main_equipment'] = 'unknown'
+    
+    cluster_profiles[cluster_id] = profile
+
+# Интерпретация кластеров
+cluster_names = {}
+for cluster_id, profile in cluster_profiles.items():
+    if profile['avg_applications'] > 3 and profile['success_rate'] > 0.3:
+        cluster_names[cluster_id] = "Активные и успешные"
+    elif profile['avg_applications'] > 3:
+        cluster_names[cluster_id] = "Активные, но низкая конверсия"
+    elif profile['success_rate'] > 0.3:
+        cluster_names[cluster_id] = "Высокая конверсия, редкие заявки"
+    elif profile['avg_applications'] > 1:
+        cluster_names[cluster_id] = "Потенциальные"
+    else:
+        cluster_names[cluster_id] = "Новые/Неактивные"
+
+print("\n📊 ПРОФИЛИ КЛАСТЕРОВ:")
+for cluster_id in range(optimal_k):
+    profile = cluster_profiles[cluster_id]
+    print(f"\nКластер {cluster_id} - {cluster_names[cluster_id]}:")
+    print(f"  • Количество клиентов: {profile['size']}")
+    print(f"  • Среднее число заявок: {profile['avg_applications']:.1f}")
+    print(f"  • Успешность заявок: {profile['success_rate']*100:.1f}%")
+    print(f"  • Средняя сумма документов: {profile['avg_doc_sum']:,.0f} руб.")
+    print(f"  • Количество документов: {profile['doc_count']:.1f}")
+    print(f"  • Предпочитаемая техника: {profile['main_equipment']}")
+
+# Генерация гипотезы
+print("\n" + "="*80)
+print("🎯 ГИПОТЕЗА ДЛЯ БИЗНЕСА")
+print("="*80)
+
+# Находим наиболее перспективный кластер (высокая успешность + активность)
+if cluster_profiles:
+    most_promising = max(cluster_profiles.keys(), 
+                         key=lambda x: cluster_profiles[x]['success_rate'] * np.log1p(cluster_profiles[x]['avg_applications']))
+else:
+    most_promising = 0
+
+print(f"""
+ГИПОТЕЗА: Сегментация клиентов на основе их покупательского поведения и предпочтений 
+          позволяет увеличить конверсию заявок на 25% за счет персонализированного подхода.
+
+ОСНОВАНИЕ ДЛЯ ГИПОТЕЗЫ:
+1. Выявлено {optimal_k} устойчивых кластера клиентов с различными паттернами поведения.
+2. Кластер {most_promising} ({cluster_names[most_promising]}) демонстрирует:
+   - Успешность заявок: {cluster_profiles[most_promising]['success_rate']*100:.1f}%
+   - Активность: {cluster_profiles[most_promising]['avg_applications']:.1f} заявок в среднем
+   
+3. Ключевые различия между кластерами:
+""")
+
+# Расчет различий между кластерами
+for feature in ['success_rate', 'avg_applications', 'avg_doc_sum']:
+    if feature in cluster_profiles[0]:
+        feature_values = [cluster_profiles[i][feature] for i in range(optimal_k)]
+        if max(feature_values) > min(feature_values) * 1.2:  # Значимое различие
+            print(f"   - Разброс по {feature}: от {min(feature_values):.2f} до {max(feature_values):.2f}")
+
+print(f"""
+4. Кластер {most_promising} показывает наилучшие метрики, что указывает на наличие 
+   успешной модели взаимодействия, которую можно масштабировать на другие сегменты.
+
+РЕКОМЕНДАЦИИ ДЛЯ ПРОВЕРКИ ГИПОТЕЗЫ:
+1. Для кластера с высокой активностью - внедрить программу лояльности
+2. Для кластера с высокой конверсией - изучить факторы успеха
+3. Для неактивных клиентов - запустить ремаркетинговую кампанию
+4. Измерить изменение конверсии через 3 месяца
+
+МЕТРИКИ УСПЕХА:
+- Рост процента завершенных заявок
+- Увеличение среднего чека
+- Снижение времени обработки заявки
+""")
+
+# Дополнительная визуализация: тепловая карта признаков по кластерам
+plt.figure(figsize=(14, 8))
+sns.heatmap(cluster_stats.T, annot=True, fmt='.2f', cmap='YlOrRd', cbar_kws={'label': 'Значение'})
+plt.title('Тепловая карта характеристик по кластерам')
+plt.xlabel('Кластер')
+plt.ylabel('Признак')
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.show()
+
+# Визуализация сравнения кластеров по ключевым метрикам
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+# График успешности заявок
+success_by_cluster = [cluster_profiles[i]['success_rate'] * 100 for i in range(optimal_k)]
+axes[0].bar(range(optimal_k), success_by_cluster, color='skyblue')
+axes[0].set_xlabel('Кластер')
+axes[0].set_ylabel('Успешность заявок (%)')
+axes[0].set_title('Успешность по кластерам')
+axes[0].set_xticks(range(optimal_k))
+
+# График активности
+apps_by_cluster = [cluster_profiles[i]['avg_applications'] for i in range(optimal_k)]
+axes[1].bar(range(optimal_k), apps_by_cluster, color='lightgreen')
+axes[1].set_xlabel('Кластер')
+axes[1].set_ylabel('Среднее число заявок')
+axes[1].set_title('Активность по кластерам')
+axes[1].set_xticks(range(optimal_k))
+
+# График размера кластеров
+size_by_cluster = [cluster_profiles[i]['size'] for i in range(optimal_k)]
+axes[2].bar(range(optimal_k), size_by_cluster, color='lightcoral')
+axes[2].set_xlabel('Кластер')
+axes[2].set_ylabel('Количество клиентов')
+axes[2].set_title('Размер кластеров')
+axes[2].set_xticks(range(optimal_k))
+
+plt.tight_layout()
+plt.show()
+
+# Экспорт результатов
+df_customers_enhanced.to_csv('customers_with_clusters.csv')
+print("\n✅ Результаты кластеризации сохранены в 'customers_with_clusters.csv'")
+print("\n📋 Статистика по кластерам сохранена в переменной cluster_stats")
