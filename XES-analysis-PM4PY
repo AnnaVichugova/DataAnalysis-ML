@@ -30,9 +30,8 @@ pm4py.view_events_distribution_graph(log)
 # Визуализация распределения продолжительности кейсов - сколько времени в среднем занимает завершение кейса, полезно для анализа эффективности процессов
 pm4py.view_case_duration_graph(log)
 
+
 ############################ ячейка 3 - построение BPMN с комментариями #######################
-# Загрузка журнала из файла log.xes
-log = xes_importer.apply('/content/log.xes')
 
 # Функция для форматирования длительности
 def format_duration(minutes):
@@ -94,8 +93,6 @@ bpmn_model = pm4py.discover_bpmn_inductive(log)
 pm4py.view_bpmn(bpmn_model)
 
 ############################ ячейка 4 - построение сети Петри #######################
-# Загрузка журнала из файла log.xes
-log = xes_importer.apply('/content/log.xes')
 
 # Обнаружение сети Петри с помощью альфа-алгоритма
 net, initial_marking, final_marking = alpha_miner.apply(log)
@@ -104,8 +101,6 @@ net, initial_marking, final_marking = alpha_miner.apply(log)
 pm4py.view_petri_net(net, initial_marking, final_marking)
 
 ############################ ячейка 5 - построение BPMN-диаграммы #######################
-# Загрузка журнала из файла log.xes
-log = xes_importer.apply('/content/log.xes')
 
 # Обнаружение BPMN модели с использованием индуктивного метода на основе лога
 bpmn_model = pm4py.discover_bpmn_inductive(log)
@@ -135,8 +130,6 @@ for count,trace in enumerate(replayed_traces, start=1):
     pp.pprint(trace)
 
 ############################ ячейка 7 - построение DFG-дерева процесса #######################
-# Загрузка журнала из файла log.xes
-log = xes_importer.apply('/content/log.xes')
 
 # Обнаруживаем граф напрямую следующих событий (Directly-Follows Graph, DFG)
 # Метод discover_dfg возвращает три значения:
@@ -154,8 +147,6 @@ print("Начальные активности:", start_activities)
 print("Конечные активности:", end_activities)
 
 ############################ ячейка 8 - построение эвристической сети процессов #######################
-# Загрузка журнала из файла log.xes
-log = xes_importer.apply('/content/log.xes')
 
 #обнаружение эвристической сети
 heuristic_net = pm4py.discover_heuristics_net(log)
@@ -167,9 +158,6 @@ pm4py.view_heuristics_net(heuristic_net)
 print(heuristic_net)
 
 ############################ ячейка 9 - получение статистики по вариантам выполнения процессов #######################
-
-# Загрузка журнала из файла log.xes
-log = xes_importer.apply('/content/log.xes')
 
 ## Получаем статистику по вариантам
 variant_stats = variants_get.get_variants(log)
