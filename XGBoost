@@ -1,4 +1,4 @@
-############################ ячейка 1 - установка библиотек и импорт модулей #######################
+############################ ячейка 1 - установка библиотек и импорт модулей ######################
 !pip install pandas numpy scikit-learn matplotlib seaborn xgboost shap imbalanced-learn
 
 import pandas as pd
