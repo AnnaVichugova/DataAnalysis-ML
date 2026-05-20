@@ -15,15 +15,16 @@ from sklearn.metrics import silhouette_score
 
 warnings.filterwarnings('ignore')
 
-############################ ячейка 2 - чтение CSV-файлов #######################
-# Загружаем только нужные для кластеризации файлы
+############################ ячейка 2 - подготовка данных из CSV-файлов #######################
+
+# нужные для кластеризации данные из файлов
 df_applications = pd.read_csv('/content/applications.csv', sep=',', encoding='utf-8')
 df_customers = pd.read_csv('/content/customers.csv', sep=',', encoding='utf-8')
 df_managers = pd.read_csv('/content/managers.csv', sep=',', encoding='utf-8')
 df_documents = pd.read_csv('/content/documents.csv', sep=',', encoding='utf-8')
 df_payments = pd.read_csv('/content/payments.csv', sep=',', encoding='utf-8')
 
-# Переименование признаков
+# переименование признаков
 df_customers = df_customers.rename(columns={
     'ID клиента': 'customer_id', 
     'Имя': 'customer_name', 
@@ -37,7 +38,7 @@ df_managers = df_managers.rename(columns={
     'Специализация': 'manager_specialization'
 })
 
-# Словарь для перевода признаков
+# словарь для перевода признаков
 feature_names_ru = {
     'customer_type': 'Тип клиента',
     'customer_status': 'Статус клиента',
@@ -48,17 +49,13 @@ feature_names_ru = {
 }
 
 ############################ ячейка 3 - подготовка к кластеризации #######################
-# ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================
-# Функция для предобработки дат
+# предобработка дат
 def preprocess_dates(df, date_columns):
     for col in date_columns:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors='coerce')
     return df
 
-# Предобработка дат
 df_applications = preprocess_dates(df_applications, ['Дата поступления', 'Дата закрытия'])
 df_documents = preprocess_dates(df_documents, ['Дата создания'])
 if 'Дата' in df_payments.columns:
@@ -66,49 +63,32 @@ if 'Дата' in df_payments.columns:
 
 print("=== Данные загружены ===\n")
 
-# ============================================================
-# СОЗДАНИЕ МАППИНГА customer_id -> ИНН (customer_inn)
-# ============================================================
-print("=== СОЗДАНИЕ СВЯЗЕЙ МЕЖДУ ТАБЛИЦАМИ ===")
-
-# Убедимся, что ИНН - строкового типа для корректного сопоставления
-df_customers['customer_inn'] = df_customers['customer_inn'].astype(str)
+# проверка типа ИНН (строка)
+['customer_inn'] = df_customers['customer_inn'].astype(str)
 df_documents['ИНН контрагента'] = df_documents['ИНН контрагента'].astype(str)
 df_payments['ИНН плательщика'] = df_payments['ИНН плательщика'].astype(str)
 
-# Создаем маппинг: customer_id -> ИНН (customer_inn)
+# маппинг customer_id -> ИНН (customer_inn)
 customer_id_to_inn = df_customers.set_index('customer_id')['customer_inn'].to_dict()
 inn_to_customer_id = {v: k for k, v in customer_id_to_inn.items()}
 
-print(f"✓ Создан маппинг для {len(customer_id_to_inn)} клиентов")
+# агрегация признаков из заявок (группируем по ИНН через маппинг) ----
 
-# ============================================================
-# 1. АГРЕГАЦИЯ ПРИЗНАКОВ ДЛЯ КЛАСТЕРИЗАЦИИ КЛИЕНТОВ
-# ============================================================
-
-# ---- Признаки из заявок (группируем по ИНН через маппинг) ----
-print("\n--- Обработка заявок ---")
-
-# Добавляем ИНН клиента в заявки
+# добавление ИНН клиента в заявки
 df_applications_with_inn = df_applications.copy()
 df_applications_with_inn['ИНН_клиента'] = df_applications_with_inn['Клиент'].map(customer_id_to_inn)
 
-# Проверяем, сколько заявок успешно сопоставилось
+# проверка количества сопоставлений по маппингу
 mapped_count = df_applications_with_inn['ИНН_клиента'].notna().sum()
 print(f"  Заявок с сопоставленным ИНН: {mapped_count} из {len(df_applications_with_inn)}")
 
-# Если не сопоставилось, возможно 'Клиент' - это название компании
+# при отсутствии совпадений попытка сопоставить по названию клиента
 if mapped_count == 0:
-    print("  Внимание: не удалось сопоставить заявки по customer_id.")
-    print("  Пробуем сопоставить по названию клиента...")
-    
-    # Создаем маппинг по названию клиента
     name_to_inn = df_customers.set_index('customer_name')['customer_inn'].to_dict()
     df_applications_with_inn['ИНН_клиента'] = df_applications_with_inn['Клиент'].map(name_to_inn)
     mapped_count = df_applications_with_inn['ИНН_клиента'].notna().sum()
-    print(f"  Заявок с сопоставленным ИНН по названию: {mapped_count} из {len(df_applications_with_inn)}")
 
-# Группируем по ИНН
+# группировка по ИНН
 applications_features = df_applications_with_inn.groupby('ИНН_клиента').agg({
     'Номер': 'count',
     'Статус': lambda x: (x == 'завершена').sum(),
@@ -117,9 +97,7 @@ applications_features = df_applications_with_inn.groupby('ИНН_клиента'
 applications_features['success_rate'] = (applications_features['successful_applications'] / 
                                           applications_features['total_applications']).fillna(0)
 
-print(f"✓ Создано {len(applications_features)} записей в applications_features")
-
-# ---- Извлечение техники из текста заявок ----
+# извлечение нужной техники из текста заявок
 def extract_equipment_type(text):
     if pd.isna(text):
         return 'unknown'
@@ -172,18 +150,15 @@ def extract_equipment_type(text):
 
 df_applications_with_inn['equipment_type'] = df_applications_with_inn['Содержание заявки'].apply(extract_equipment_type)
 
-# Создаем crosstab для техники
 equipment_preferences = pd.crosstab(df_applications_with_inn['ИНН_клиента'], df_applications_with_inn['equipment_type'])
-print(f"✓ Создано equipment_preferences: {equipment_preferences.shape}")
 
-# Убедимся, что все нужные колонки присутствуют
+# проверка, что все нужные колонки присутствуют
 expected_equipment = ['Дорожная', 'Строительная', 'Коммунальная', 'other']
 for eq in expected_equipment:
     if eq not in equipment_preferences.columns:
         equipment_preferences[eq] = 0
-        print(f"  Добавлена недостающая колонка: {eq}")
 
-# Переименуем колонки для удобства
+# переименование колонок (для удобства)
 equipment_preferences = equipment_preferences.rename(columns={
     'Дорожная': 'road',
     'Строительная': 'construction',
@@ -191,12 +166,11 @@ equipment_preferences = equipment_preferences.rename(columns={
     'other': 'other'
 })
 
-# ---- Признаки из документов (группируем по ИНН контрагента) ----
-print("\n--- Обработка документов ---")
-
+# извлечение признаков из документов (группировка по ИНН контрагента) ----
 documents_features = pd.DataFrame()
+
 if 'Тип контрагента' in df_documents.columns and 'Сумма' in df_documents.columns:
-    # Фильтруем только клиентов
+    # фильтрация по клиентам
     client_docs = df_documents[df_documents['Тип контрагента'] == 'Клиент'].copy()
     print(f"  Найдено документов для клиентов: {len(client_docs)}")
     
@@ -206,15 +180,13 @@ if 'Тип контрагента' in df_documents.columns and 'Сумма' in d
             'Статус': lambda x: (x == 'подписан').sum() if 'Статус' in client_docs.columns else 0
         }).fillna(0)
         documents_features.columns = ['total_sum', 'avg_sum', 'doc_count', 'signed_docs']
-        print(f"✓ Создано {len(documents_features)} записей в documents_features")
+        print(f"Создано {len(documents_features)} записей в documents_features")
     else:
-        print("⚠ Нет документов с Тип контрагента = 'Клиент'")
+        print("Нет документов с Тип контрагента = 'Клиент'")
 else:
-    print("⚠ В данных о документах нет нужных колонок")
+    print("В данных о документах нет нужных колонок")
 
-# ---- Платежная активность (группируем по ИНН плательщика) ----
-print("\n--- Обработка платежей ---")
-
+# обработка платежей (группировка по ИНН плательщика) ----
 payments_features = pd.DataFrame()
 if 'Тип' in df_payments.columns and 'ИНН плательщика' in df_payments.columns and 'Сумма' in df_payments.columns:
     incoming_payments = df_payments[df_payments['Тип'] == 'Входящий'].copy()
@@ -225,54 +197,53 @@ if 'Тип' in df_payments.columns and 'ИНН плательщика' in df_pay
             'Сумма': ['sum', 'mean', 'count']
         }).fillna(0)
         payments_features.columns = ['payment_sum', 'payment_avg', 'payment_count']
-        print(f"✓ Создано {len(payments_features)} записей в payments_features")
+        print(f"Создано {len(payments_features)} записей в payments_features")
     else:
-        print("⚠ Нет входящих платежей")
+        print("Нет входящих платежей")
 else:
-    print("⚠ В данных о платежах нет нужных колонок")
+    print("В данных о платежах нет нужных колонок")
 
-# ---- Объединение всех признаков по ИНН ----
-print("\n--- Объединение признаков ---")
+# объединение всех признаков по ИНН
 
-# Создаем DataFrame с клиентами, индексированный по ИНН (customer_inn)
+# создание датафрейма с клиентами, индексированного по ИНН (customer_inn)
 df_customers_by_inn = df_customers.copy()
 df_customers_by_inn.set_index('customer_inn', inplace=True)
 print(f"  Клиентов в df_customers: {len(df_customers_by_inn)}")
 
-# Добавляем признаки из заявок
+# добавление признаков из заявок
 df_customers_enhanced = df_customers_by_inn.join(applications_features, how='left').fillna(0)
 print(f"  После добавления заявок: {len(df_customers_enhanced)} клиентов")
 
-# Добавляем признаки по типам техники
+# добавление признаков по типам техники
 df_customers_enhanced = df_customers_enhanced.join(equipment_preferences, how='left').fillna(0)
-print(f"  После добавления техники: {len(df_customers_enhanced)} клиентов")
+print(f"После добавления техники: {len(df_customers_enhanced)} клиентов")
 
-# Добавляем признаки из документов
+# добавление признаков из документов
 if not documents_features.empty:
     df_customers_enhanced = df_customers_enhanced.join(documents_features, how='left').fillna(0)
     print(f"  После добавления документов: {len(df_customers_enhanced)} клиентов")
 else:
     for col in ['total_sum', 'avg_sum', 'doc_count', 'signed_docs']:
         df_customers_enhanced[col] = 0
-    print("  ⚠ Признаки из документов не добавлены")
+    print("Признаки из документов не добавлены")
 
-# Добавляем признаки из платежей
+# добавление признаков из платежей
 if not payments_features.empty:
     df_customers_enhanced = df_customers_enhanced.join(payments_features, how='left').fillna(0)
-    print(f"  После добавления платежей: {len(df_customers_enhanced)} клиентов")
+    print(f"После добавления платежей: {len(df_customers_enhanced)} клиентов")
 else:
     for col in ['payment_sum', 'payment_avg', 'payment_count']:
         df_customers_enhanced[col] = 0
-    print("  ⚠ Признаки из платежей не добавлены")
+    print("Признаки из платежей не добавлены")
 
-# ---- Добавляем информацию о менеджере ----
-print("\n--- Информация о менеджерах ---")
+# добавление информацию о менеджере ----
+print("Информация о менеджерах")
 
 if 'Менеджер' in df_applications.columns and 'manager_id' in df_managers.columns:
     manager_mapping = df_managers.set_index('manager_id')['manager_specialization'].to_dict()
     df_customers_enhanced['manager_specialization'] = 'unknown'
     
-    # Используем заявки с уже добавленным ИНН
+    # использование заявок с уже добавленным ИНН
     for inn in df_customers_enhanced.index:
         customer_apps = df_applications_with_inn[df_applications_with_inn['ИНН_клиента'] == inn]
         if len(customer_apps) > 0:
@@ -281,16 +252,12 @@ if 'Менеджер' in df_applications.columns and 'manager_id' in df_managers
                 df_customers_enhanced.loc[inn, 'manager_specialization'] = manager_mapping[manager_id]
     
     managers_assigned = (df_customers_enhanced['manager_specialization'] != 'unknown').sum()
-    print(f"✓ Добавлена специализация менеджера для {managers_assigned} клиентов")
+    print(f"Добавлена специализация менеджера для {managers_assigned} клиентов")
 else:
     df_customers_enhanced['manager_specialization'] = 'unknown'
-    print("⚠ Нет данных о менеджерах")
+    print("Нет данных о менеджерах")
 
-# ---- Проверка результатов ----
-print("\n" + "="*80)
-print("ПРОВЕРКА РЕЗУЛЬТАТОВ ОБЪЕДИНЕНИЯ")
-print("="*80)
-
+# проверка результатов объединения
 nonzero_docs = df_customers_enhanced[df_customers_enhanced['total_sum'] > 0]
 nonzero_payments = df_customers_enhanced[df_customers_enhanced['payment_sum'] > 0]
 
@@ -303,11 +270,7 @@ if len(nonzero_docs) > 0:
     print("\nПримеры клиентов с документами:")
     print(nonzero_docs[['customer_name', 'total_sum', 'doc_count', 'signed_docs', 'payment_sum']].head(10))
 
-# ============================================================
-# ПОДГОТОВКА К КЛАСТЕРИЗАЦИИ
-# ============================================================
-
-# Словарь для перевода признаков на русский
+# словарь для перевода признаков на русский
 feature_names_ru_cluster = {
     'total_applications': 'Всего заявок',
     'successful_applications': 'Успешных заявок',
@@ -326,7 +289,7 @@ feature_names_ru_cluster = {
     'manager_specialization': 'Специализация менеджера'
 }
 
-# Кодирование категориальных признаков
+# кодирование категориальных признаков
 categorical_cols = ['customer_type', 'customer_status', 'manager_specialization']
 label_encoders_cluster = {}
 
@@ -336,11 +299,11 @@ for col in categorical_cols:
         df_customers_enhanced[col + '_encoded'] = le.fit_transform(df_customers_enhanced[col].astype(str))
         label_encoders_cluster[col] = le
 
-# Выбираем числовые признаки для кластеризации
+# выбор числовых признаков для кластеризации
 numeric_features = ['total_applications', 'success_rate', 'total_sum', 'avg_sum', 
                     'doc_count', 'signed_docs', 'payment_sum', 'payment_avg', 'payment_count']
 
-# Добавляем признаки по типам техники (теперь они точно есть)
+# добавление признаков по типам техники
 equipment_cols = ['road', 'construction', 'municipal', 'other']
 for col in equipment_cols:
     if col not in df_customers_enhanced.columns:
@@ -348,7 +311,7 @@ for col in equipment_cols:
         print(f"  Добавлена недостающая колонка: {col}")
     numeric_features.append(col)
 
-# Убираем NaN и бесконечности
+# очистка (NaN и бесконечности)
 for col in numeric_features:
     if col in df_customers_enhanced.columns:
         df_customers_enhanced[col] = df_customers_enhanced[col].replace([np.inf, -np.inf], 0).fillna(0)
@@ -364,11 +327,11 @@ print(f"\nРазмерность: {X_cluster.shape[0]} клиентов, {X_clus
 
 ############################ ячейка 4 - кластеризация #######################
 
-# Нормализация
+# нормализация
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X_cluster)
 
-# Определение оптимального числа кластеров
+# определение оптимального числа кластеров
 inertias = []
 silhouette_scores = []
 K_range = range(2, 8)
@@ -379,7 +342,7 @@ for k in K_range:
     inertias.append(kmeans.inertia_)
     silhouette_scores.append(silhouette_score(X_scaled, kmeans.labels_))
 
-# Визуализация
+# визуализация
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
 axes[0].plot(K_range, inertias, 'bo-', linewidth=2, markersize=8)
@@ -397,16 +360,14 @@ axes[1].grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-# Выбираем оптимальное число кластеров
+# выбор оптимального числа кластеров
 optimal_k = 4
 kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
 clusters = kmeans.fit_predict(X_scaled)
 
 df_customers_enhanced['Cluster'] = clusters
 
-# 3. АНАЛИЗ КЛАСТЕРОВ
-
-# Статистика по кластерам (с русскими названиями)
+# статистика по кластерам (с русскими названиями)
 cluster_stats = df_customers_enhanced.groupby('Cluster')[numeric_features].mean()
 cluster_stats_ru = cluster_stats.rename(columns=feature_names_ru_cluster)
 cluster_counts = df_customers_enhanced['Cluster'].value_counts().sort_index()
@@ -424,7 +385,7 @@ print("📊 ХАРАКТЕРИСТИКИ КЛАСТЕРОВ (средние зн
 print("="*80)
 print(cluster_stats_ru.round(2).to_string())
 
-# Визуализация кластеров (2D проекция)
+# визуализация кластеров (2D проекция)
 from sklearn.decomposition import PCA
 
 pca = PCA(n_components=2)
@@ -439,13 +400,11 @@ plt.title('Визуализация кластеров клиентов (PCA)', 
 plt.grid(True, alpha=0.3)
 plt.show()
 
-# 4. ГЕНЕРАЦИЯ ГИПОТЕЗЫ
-
 print("\n" + "="*80)
 print("🎯 ГЕНЕРАЦИЯ БИЗНЕС-ГИПОТЕЗЫ НА ОСНОВЕ КЛАСТЕРИЗАЦИИ")
 print("="*80)
 
-# Анализ профилей кластеров
+# анализ профилей кластеров
 cluster_profiles = {}
 
 for cluster_id in range(optimal_k):
@@ -473,7 +432,7 @@ for cluster_id in range(optimal_k):
     
     cluster_profiles[cluster_id] = profile
 
-# Более точная интерпретация кластеров на основе реальных данных
+# уточненная интерпретация кластеров на основе реальных данных
 cluster_names = {}
 for cluster_id, profile in cluster_profiles.items():
     # Премиальный сегмент (кластер 2) - высокая сумма при низкой активности
@@ -502,13 +461,12 @@ for cluster_id in range(optimal_k):
     print(f"  ├─ Среднее количество документов: {profile['doc_count']:.1f}")
     print(f"  └─ Предпочитаемая техника: {profile['main_equipment']}")
 
-# Генерация гипотезы
+# вывод гипотезы
 print("\n" + "="*80)
 print("🎯 ГИПОТЕЗА ДЛЯ БИЗНЕСА")
 print("="*80)
 
-# Находим кластер с наибольшим потенциалом для улучшения
-# Не по текущей успешности, а по потенциалу (активность * средний чек)
+# кластер с наибольшим потенциалом для улучшения, не по текущей успешности, а по потенциалу (активность * средний чек)
 most_promising = max(cluster_profiles.keys(), 
                      key=lambda x: cluster_profiles[x]['avg_applications'] * np.log1p(cluster_profiles[x]['avg_doc_sum']))
 
@@ -544,7 +502,7 @@ print(f"""
 ✅ Активация "спящих" клиентов из кластера 0
 """)
 
-# Тепловая карта признаков по кластерам
+# тепловая карта признаков по кластерам
 plt.figure(figsize=(14, 8))
 cluster_stats_renamed = cluster_stats.rename(columns=feature_names_ru_cluster)
 sns.heatmap(cluster_stats_renamed.T, annot=True, fmt='.2f', cmap='YlOrRd', 
@@ -556,7 +514,7 @@ plt.xticks(rotation=0)
 plt.tight_layout()
 plt.show()
 
-# Визуализация сравнения кластеров по ключевым метрикам
+# визуализация сравнения кластеров по ключевым метрикам
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
 success_by_cluster = [cluster_profiles[i]['success_rate'] * 100 for i in range(optimal_k)]
@@ -590,7 +548,7 @@ axes[2].grid(axis='y', alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-# Экспорт результатов
+# экспорт результатов в новый CSV-файл
 df_customers_enhanced.to_csv('customers_with_clusters.csv')
 print("\n✅ Результаты кластеризации сохранены в 'customers_with_clusters.csv'")
 print("📋 Статистика по кластерам сохранена в переменной cluster_stats")
