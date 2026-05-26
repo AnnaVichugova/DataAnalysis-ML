@@ -372,17 +372,13 @@ cluster_stats = df_customers_enhanced.groupby('Cluster')[numeric_features].mean(
 cluster_stats_ru = cluster_stats.rename(columns=feature_names_ru_cluster)
 cluster_counts = df_customers_enhanced['Cluster'].value_counts().sort_index()
 
-print("\n" + "="*80)
-print("📊 РАСПРЕДЕЛЕНИЕ ПО КЛАСТЕРАМ")
-print("="*80)
+print("\n ===============  РАСПРЕДЕЛЕНИЕ ПО КЛАСТЕРАМ ===================")
 for cluster_id in range(optimal_k):
     count = cluster_counts[cluster_id]
     percent = count / cluster_counts.sum() * 100
     print(f"  Кластер {cluster_id}: {count} клиентов ({percent:.1f}%)")
 
-print("\n" + "="*80)
-print("📊 ХАРАКТЕРИСТИКИ КЛАСТЕРОВ (средние значения)")
-print("="*80)
+print(" ============== ХАРАКТЕРИСТИКИ КЛАСТЕРОВ (средние значения) ================")
 print(cluster_stats_ru.round(2).to_string())
 
 # визуализация кластеров (2D проекция)
@@ -400,9 +396,7 @@ plt.title('Визуализация кластеров клиентов (PCA)', 
 plt.grid(True, alpha=0.3)
 plt.show()
 
-print("\n" + "="*80)
-print("🎯 ГЕНЕРАЦИЯ БИЗНЕС-ГИПОТЕЗЫ НА ОСНОВЕ КЛАСТЕРИЗАЦИИ")
-print("="*80)
+print(" \n ================ ГЕНЕРАЦИЯ БИЗНЕС-ГИПОТЕЗЫ НА ОСНОВЕ КЛАСТЕРИЗАЦИИ =============")
 
 # анализ профилей кластеров
 cluster_profiles = {}
@@ -448,8 +442,7 @@ for cluster_id, profile in cluster_profiles.items():
     else:
         cluster_names[cluster_id] = "🟡 Низкоактивные (спящие клиенты)"
 
-print("\n📊 ПРОФИЛИ КЛАСТЕРОВ:")
-print("─" * 60)
+print("\n ================ ПРОФИЛИ КЛАСТЕРОВ ========================")
 
 for cluster_id in range(optimal_k):
     profile = cluster_profiles[cluster_id]
@@ -462,16 +455,14 @@ for cluster_id in range(optimal_k):
     print(f"  └─ Предпочитаемая техника: {profile['main_equipment']}")
 
 # вывод гипотезы
-print("\n" + "="*80)
-print("🎯 ГИПОТЕЗА ДЛЯ БИЗНЕСА")
-print("="*80)
+print("\n ================== ГИПОТЕЗА ДЛЯ БИЗНЕСА =================")
 
 # кластер с наибольшим потенциалом для улучшения, не по текущей успешности, а по потенциалу (активность * средний чек)
 most_promising = max(cluster_profiles.keys(), 
                      key=lambda x: cluster_profiles[x]['avg_applications'] * np.log1p(cluster_profiles[x]['avg_doc_sum']))
 
 print(f"""
-ГИПОТЕЗА: Сегментация клиентов на основе их покупательского поведения и предпочтений 
+\n ГИПОТЕЗА: Сегментация клиентов на основе их покупательского поведения и предпочтений 
           позволяет увеличить конверсию заявок на 25% за счет персонализированного подхода.
 
 ОСНОВАНИЕ ДЛЯ ГИПОТЕЗЫ:
@@ -550,5 +541,5 @@ plt.show()
 
 # экспорт результатов в новый CSV-файл
 df_customers_enhanced.to_csv('customers_with_clusters.csv')
-print("\n✅ Результаты кластеризации сохранены в 'customers_with_clusters.csv'")
-print("📋 Статистика по кластерам сохранена в переменной cluster_stats")
+print("\n Результаты кластеризации сохранены в 'customers_with_clusters.csv'")
+print("\n Статистика по кластерам сохранена в переменной cluster_stats")
