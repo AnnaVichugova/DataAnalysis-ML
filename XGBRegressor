@@ -1,0 +1,1239 @@
+!pip install pandas numpy scikit-learn matplotlib seaborn xgboost shap imbalanced-learn
+############################ ячейка 1 - импорт модулей #######################
+from google.colab import files
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    roc_curve, mean_absolute_error, mean_squared_error, r2_score,
+    silhouette_score, davies_bouldin_score, adjusted_rand_score,
+    confusion_matrix, classification_report
+)
+from sklearn.preprocessing import LabelEncoder
+from sklearn.feature_selection import SelectKBest, f_classif
+from imblearn.over_sampling import SMOTE
+import xgboost as xgb
+from matplotlib.patches import Patch
+
+import shap
+import re
+import warnings
+warnings.filterwarnings('ignore')
+
+
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.cluster import KMeans
+
+import random
+from datetime import datetime
+
+############################ ячейка 2 - чтение CSV-файлов #######################
+df_applications = pd.read_csv('/content/applications.csv', sep=',', encoding='utf-8')
+df_customers = pd.read_csv('/content/customers.csv', sep=',', encoding='utf-8')
+df_managers = pd.read_csv('/content/managers.csv', sep=',', encoding='utf-8')
+df_documents = pd.read_csv('/content/documents.csv', sep=',', encoding='utf-8')
+df_contracts_content = pd.read_csv('/content/contracts_content.csv', sep=',', encoding='utf-8')
+df_products = pd.read_csv('/content/products.csv', sep=',', encoding='utf-8')
+df_providers = pd.read_csv('/content/providers.csv', sep=',', encoding='utf-8')
+df_payments = pd.read_csv('/content/payments.csv', sep=',', encoding='utf-8')
+
+# Переименование признаков
+df_customers = df_customers.rename(columns={
+    'ID клиента': 'customer_id',
+    'Имя': 'customer_name',
+    'Тип': 'customer_type',
+    'Статус': 'customer_status',
+    'ИНН': 'customer_inn',
+    'Телефон': 'customer_phone',
+    'Email': 'customer_email',
+    'Адрес': 'customer_address'
+})
+
+df_managers = df_managers.rename(columns={
+    'ID менеджера': 'manager_id',
+    'Имя': 'manager_name',
+    'Специализация': 'manager_specialization',
+    'Телефон': 'manager_phone',
+    'Email': 'manager_email'
+})
+
+df_documents = df_documents.rename(columns={
+    'Номер документа': 'document_number',
+    'Дата создания': 'document_date',
+    'ИНН контрагента': 'counterparty_inn',
+    'Название контрагента': 'counterparty_name',
+    'Тип контрагента': 'counterparty_type',
+    'Тип услуги': 'service_type',
+    'Тип документа': 'document_type',
+    'Вид документа': 'document_kind',
+    'Статус': 'document_status',
+    'Менеджер': 'document_manager',
+    'Сумма': 'document_amount'
+})
+
+df_contracts_content = df_contracts_content.rename(columns={
+    'Договор': 'contract_number',
+    'Артикул': 'product_sku',
+    'Количество': 'quantity'
+})
+
+df_products = df_products.rename(columns={
+    'Артикул': 'product_sku',
+    'Название': 'product_name',
+    'Категория': 'product_category',
+    'Поставщик': 'provider_id',
+    'Стоимость покупки': 'purchase_cost',
+    'Стоимость аренды': 'rental_cost'
+})
+
+print("\n ========== Все CSV-файлы загружены и переименованы ===========")
+print(f"   Заявок: {len(df_applications)}")
+print(f"   Клиентов: {len(df_customers)}")
+print(f"   Менеджеров: {len(df_managers)}")
+print(f"   Документов: {len(df_documents)}")
+print(f"   Содержимое договоров: {len(df_contracts_content)}")
+print(f"   Товаров: {len(df_products)}")
+print(f"   Поставщиков: {len(df_providers)}")
+print(f"   Платежей: {len(df_payments)}")
+
+############################ ячейка 3 - фича-инжиниринг #######################
+print("\n ============== ШАГ 1: ЗАГРУЗКА И ПОДГОТОВКА ДАННЫХ ===========")
+
+# ---- 1. ПРАВИЛЬНОЕ ОПРЕДЕЛЕНИЕ ЦЕЛЕВОЙ ПЕРЕМЕННОЙ ----
+print("\n1. Определение целевой переменной (конверсия заявки в договор)")
+
+# Правильная фильтрация: договоры от клиентов
+customer_contracts = df_documents[
+    (df_documents['document_kind'] == 'Договор') &
+    (df_documents['counterparty_type'] == 'Клиент')
+].copy()
+
+if len(customer_contracts) > 0:
+    print(f"\n   Найдено договоров от клиентов: {len(customer_contracts)}")
+else:
+    print("   ⚠️ Не найдено договоров от клиентов!")
+
+# Связываем договоры с заявками
+applications_with_contracts = set()
+
+# Предварительно конвертируем даты заявок для ускорения
+df_applications['app_date_converted'] = pd.to_datetime(df_applications['Дата поступления'], errors='coerce')
+
+for idx, contract in customer_contracts.iterrows():
+    contract_number = contract['document_number']
+    contract_customer_name = contract['counterparty_name']
+    contract_customer_inn = contract['counterparty_inn']
+
+    # Безопасная конвертация даты договора (НЕ пропускаем будущие даты)
+    try:
+        contract_date = pd.to_datetime(contract['document_date'], errors='coerce')
+
+        # Пропускаем только некорректные даты
+        if pd.isna(contract_date):
+            if idx < 5:
+                print(f"   ⚠️ Пропущен договор {contract_number}: некорректная дата '{contract['document_date']}'")
+            continue
+
+        # НЕ пропускаем будущие даты - используем их как есть
+        # (будущие даты могут быть в данных, это нормально)
+
+    except Exception as e:
+        if idx < 5:
+            print(f"   ⚠️ Пропущен договор {contract_number}: ошибка конвертации даты - {str(e)[:50]}")
+        continue
+
+    # Ищем клиента по ИНН или названию
+    customer = df_customers[
+        (df_customers['customer_inn'] == contract_customer_inn) |
+        (df_customers['customer_name'] == contract_customer_name)
+    ]
+
+    if len(customer) > 0:
+        customer_id = customer.iloc[0]['customer_id']
+
+        # Ищем заявки этого клиента до даты договора
+        # Для будущих дат договора ищем заявки с любой датой (<= будущая дата)
+        matching_apps = df_applications[
+            (df_applications['Клиент'] == customer_id) &
+            (df_applications['app_date_converted'] <= contract_date) &
+            (df_applications['app_date_converted'].notna())
+        ]
+
+        if len(matching_apps) > 0:
+            latest_app = matching_apps.sort_values('app_date_converted', ascending=False).iloc[0]
+            applications_with_contracts.add(latest_app['Номер'])
+            if idx < 10:
+                print(f"   Связан договор {contract_number} ({contract_date.date()}) с заявкой {latest_app['Номер']}")
+    else:
+        if idx < 5:
+            print(f"   ⚠️ Для договора {contract_number} не найден клиент: {contract_customer_name}")
+
+# Удаляем временную колонку
+df_applications = df_applications.drop(columns=['app_date_converted'])
+
+print(f"\n   Заявок, которые привели к договору: {len(applications_with_contracts)}")
+
+# Создаем целевую переменную
+df_applications['target'] = df_applications['Номер'].isin(applications_with_contracts).astype(int)
+
+print(f"\n   Распределение целевой переменной:")
+print(f"   Конверсия в договор: {df_applications['target'].sum()} ({df_applications['target'].mean()*100:.1f}%)")
+print(f"   Нет конверсии: {(len(df_applications) - df_applications['target'].sum())} ({(1-df_applications['target'].mean())*100:.1f}%)")
+
+# ---- 2. ПРИЗНАКИ ИЗ ДОГОВОРОВ (ДЛЯ ИСТОРИЧЕСКИХ ДАННЫХ) ----
+print("\n2. Извлечение признаков из договоров...")
+
+# Агрегируем договоры по клиентам
+if len(customer_contracts) > 0:
+    customer_contracts['document_amount'] = customer_contracts['document_amount'].fillna(0)
+
+    customer_contract_agg = customer_contracts.groupby('counterparty_inn').agg({
+        'document_amount': ['mean', 'max', 'min', 'sum', 'count'],
+        'document_status': lambda x: (x == 'подписан').sum() / len(x) if len(x) > 0 else 0
+    }).reset_index()
+
+    customer_contract_agg.columns = ['counterparty_inn', 'avg_contract_amount', 'max_contract_amount',
+                                      'min_contract_amount', 'total_contract_amount', 'contract_count',
+                                      'contract_signed_rate']
+
+    # Удаляем старые колонки, если они есть
+    cols_to_drop = ['avg_contract_amount', 'max_contract_amount', 'min_contract_amount',
+                    'total_contract_amount', 'contract_count', 'contract_signed_rate']
+    for col in cols_to_drop:
+        if col in df_customers.columns:
+            df_customers = df_customers.drop(columns=[col])
+
+    # Удаляем временную колонку counterparty_inn
+    if 'counterparty_inn' in df_customers.columns:
+        df_customers = df_customers.drop(columns=['counterparty_inn'])
+
+    df_customers = df_customers.merge(customer_contract_agg, left_on='customer_inn', right_on='counterparty_inn', how='left')
+    print(f"   Добавлено {len(customer_contract_agg)} записей с агрегированными данными по договорам")
+else:
+    print("   ⚠️ Нет договоров для агрегации")
+
+# Заполняем NaN для клиентов без договоров
+for col in ['avg_contract_amount', 'max_contract_amount', 'min_contract_amount', 'total_contract_amount', 'contract_count', 'contract_signed_rate']:
+    if col in df_customers.columns:
+        df_customers[col] = df_customers[col].fillna(0)
+    else:
+        df_customers[col] = 0
+
+# ---- 3. ПРИЗНАКИ ИЗ СОДЕРЖИМОГО ДОГОВОРОВ ----
+print("\n3. Извлечение признаков из содержимого договоров...")
+
+if len(df_contracts_content) > 0 and len(df_products) > 0:
+    contracts_with_products = df_contracts_content.merge(
+        df_products,
+        left_on='product_sku',
+        right_on='product_sku',
+        how='left'
+    )
+
+    if len(contracts_with_products) > 0:
+        contract_content_agg = contracts_with_products.groupby('contract_number').agg({
+            'quantity': 'sum',
+            'product_sku': 'count',
+            'purchase_cost': 'mean',
+            'rental_cost': 'mean'
+        }).reset_index()
+
+        contract_content_agg.columns = ['contract_number', 'total_quantity', 'unique_products_count',
+                                         'avg_purchase_cost', 'avg_rental_cost']
+
+        if len(customer_contracts) > 0:
+            customer_contracts = customer_contracts.merge(
+                contract_content_agg,
+                left_on='document_number',
+                right_on='contract_number',
+                how='left'
+            )
+
+            customer_content_agg = customer_contracts.groupby('counterparty_inn').agg({
+                'total_quantity': 'mean',
+                'unique_products_count': 'mean',
+                'avg_purchase_cost': 'mean',
+                'avg_rental_cost': 'mean'
+            }).reset_index()
+
+            customer_content_agg.columns = ['counterparty_inn', 'avg_order_quantity', 'avg_unique_products',
+                                             'customer_avg_purchase_cost', 'customer_avg_rental_cost']
+
+            # Удаляем старые колонки
+            cols_to_drop = ['avg_order_quantity', 'avg_unique_products', 'customer_avg_purchase_cost', 'customer_avg_rental_cost']
+            for col in cols_to_drop:
+                if col in df_customers.columns:
+                    df_customers = df_customers.drop(columns=[col])
+
+            # Удаляем временную колонку
+            if 'counterparty_inn' in df_customers.columns:
+                df_customers = df_customers.drop(columns=['counterparty_inn'])
+
+            df_customers = df_customers.merge(customer_content_agg, left_on='customer_inn', right_on='counterparty_inn', how='left')
+
+            for col in cols_to_drop:
+                if col in df_customers.columns:
+                    df_customers[col] = df_customers[col].fillna(0)
+                else:
+                    df_customers[col] = 0
+
+            print(f"   Добавлено {len(customer_content_agg)} записей с данными о содержимом договоров")
+        else:
+            for col in ['avg_order_quantity', 'avg_unique_products', 'customer_avg_purchase_cost', 'customer_avg_rental_cost']:
+                df_customers[col] = 0
+    else:
+        print("   ⚠️ Нет данных после объединения")
+        for col in ['avg_order_quantity', 'avg_unique_products', 'customer_avg_purchase_cost', 'customer_avg_rental_cost']:
+            df_customers[col] = 0
+else:
+    print("   ⚠️ Нет данных о содержимом договоров или товарах")
+    for col in ['avg_order_quantity', 'avg_unique_products', 'customer_avg_purchase_cost', 'customer_avg_rental_cost']:
+        df_customers[col] = 0
+
+# ---- 4. ПРИЗНАКИ ИЗ ПЛАТЕЖЕЙ ----
+print("\n4. Извлечение признаков из платежей...")
+
+if len(df_payments) > 0:
+    incoming_payments = df_payments[df_payments['Тип'] == 'Входящий'].copy()
+    print(f"   Входящих платежей: {len(incoming_payments)}")
+
+    if len(incoming_payments) > 0 and len(customer_contracts) > 0:
+        incoming_payments['Сумма'] = incoming_payments['Сумма'].fillna(0)
+
+        payments_by_contract = incoming_payments.groupby('Основание').agg({
+            'Сумма': ['sum', 'count', 'mean']
+        }).reset_index()
+
+        payments_by_contract.columns = ['contract_number', 'total_payment_sum', 'payment_count', 'avg_payment_amount']
+
+        customer_contracts = customer_contracts.merge(
+            payments_by_contract,
+            left_on='document_number',
+            right_on='contract_number',
+            how='left'
+        )
+
+        customer_payment_agg = customer_contracts.groupby('counterparty_inn').agg({
+            'total_payment_sum': 'mean',
+            'payment_count': 'mean',
+            'avg_payment_amount': 'mean'
+        }).reset_index()
+
+        customer_payment_agg.columns = ['counterparty_inn', 'avg_contract_payment_sum', 'avg_payment_count', 'customer_avg_payment_amount']
+
+        # Удаляем старые колонки
+        cols_to_drop = ['avg_contract_payment_sum', 'avg_payment_count', 'customer_avg_payment_amount']
+        for col in cols_to_drop:
+            if col in df_customers.columns:
+                df_customers = df_customers.drop(columns=[col])
+
+        # Удаляем временную колонку
+        if 'counterparty_inn' in df_customers.columns:
+            df_customers = df_customers.drop(columns=['counterparty_inn'])
+
+        df_customers = df_customers.merge(customer_payment_agg, left_on='customer_inn', right_on='counterparty_inn', how='left')
+
+        for col in cols_to_drop:
+            if col in df_customers.columns:
+                df_customers[col] = df_customers[col].fillna(0)
+            else:
+                df_customers[col] = 0
+
+        print(f"   Добавлено {len(customer_payment_agg)} записей с платежными данными")
+    else:
+        print("   ⚠️ Нет входящих платежей или договоров")
+        for col in ['avg_contract_payment_sum', 'avg_payment_count', 'customer_avg_payment_amount']:
+            df_customers[col] = 0
+else:
+    print("   ⚠️ Нет данных о платежах")
+    for col in ['avg_contract_payment_sum', 'avg_payment_count', 'customer_avg_payment_amount']:
+        df_customers[col] = 0
+
+# ---- 5. ФУНКЦИИ ДЛЯ ИЗВЛЕЧЕНИЯ ПРИЗНАКОВ ИЗ ТЕКСТА ----
+def extract_equipment_type(text):
+    if pd.isna(text):
+        return 'unknown'
+    text = str(text)
+    equipment_map = {
+        'Ресайклер': 'Дорожная', 'Демаркировщик': 'Дорожная', 'Грейдер': 'Дорожная',
+        'Каток': 'Дорожная', 'Асфальтоукладчик': 'Дорожная', 'Дорожная фреза': 'Дорожная',
+        'Разметочная машина': 'Дорожная', 'Бетономешалка': 'Строительная', 'Экскаватор': 'Строительная',
+        'Бульдозер': 'Строительная', 'Сваебой': 'Строительная', 'Бур': 'Строительная',
+        'Вибропогружатель': 'Строительная', 'Кран': 'Грузоподъемная', 'Погрузчик': 'Грузоподъемная',
+        'Автолифт': 'Грузоподъемная', 'Автовышка': 'Грузоподъемная', 'Манипулятор': 'Грузоподъемная',
+        'Подъемная площадка': 'Грузоподъемная', 'Стационарный кран': 'Грузоподъемная',
+        'Автомобильный кран': 'Грузоподъемная', 'Самосвал': 'Транспортная', 'Трал': 'Транспортная',
+        'Автопоезд': 'Транспортная', 'Бункеровоз': 'Транспортная', 'Бортовой грузовик': 'Транспортная',
+        'Цистерна': 'Транспортная', 'Фура': 'Транспортная', 'Низкорамник': 'Транспортная',
+        'Разбрасыватель реагентов': 'Коммунальная', 'Ассенизатор': 'Коммунальная',
+        'Снегоуборщик': 'Коммунальная', 'Моечная техника': 'Коммунальная',
+        'Поливальная машина': 'Коммунальная', 'Мусоровоз': 'Коммунальная',
+        'Трактор': 'Сельскохозяйственная', 'Опрыскиватель': 'Сельскохозяйственная',
+        'Комбайн': 'Сельскохозяйственная', 'Кормоуборщик': 'Сельскохозяйственная',
+        'Жатка': 'Сельскохозяйственная', 'Сеялка': 'Сельскохозяйственная',
+        'Харвестер': 'Лесозаготовительная', 'Форвардер': 'Лесозаготовительная',
+        'Трелёвочный трактор': 'Лесозаготовительная', 'Лесовоз': 'Лесозаготовительная',
+        'Измельчитель': 'Лесозаготовительная', 'Скиддер': 'Лесозаготовительная',
+        'Валочно-пакетирующая техника': 'Лесозаготовительная',
+        'Шахтная машина': 'Горнодобывающая', 'Буровая мачта': 'Горнодобывающая',
+        'Карьерная грузовая техника': 'Горнодобывающая', 'Забойная машина': 'Горнодобывающая',
+        'Копровая установка': 'Горнодобывающая', 'Дробильная машина': 'Горнодобывающая',
+    }
+    for equip, category in equipment_map.items():
+        if equip.lower() in text.lower():
+            return category
+    return 'other'
+
+def extract_urgency(text):
+    if pd.isna(text):
+        return 0
+    text = str(text).lower()
+    urgency_words = ['срочно', 'срочная', 'срочный', 'горящая', 'немедленно', 'сегодня', 'завтра']
+    return 1 if any(word in text for word in urgency_words) else 0
+
+def extract_politeness(text):
+    if pd.isna(text):
+        return 0
+    text = str(text).lower()
+    polite_words = ['здравствуйте', 'пожалуйста', 'спасибо', 'благодарю', 'добрый день', 'извините']
+    return sum(1 for word in polite_words if word in text)
+
+def extract_quantity(text):
+    if pd.isna(text):
+        return 1
+    import re
+    text = str(text)
+    numbers = re.findall(r'\d+', text)
+    return int(numbers[0]) if numbers else 1
+
+# ---- 6. ФУНКЦИИ ДЛЯ РАСЧЕТА ИСТОРИИ ----
+def get_customer_history_enhanced(customer_id):
+    customer_apps = df_applications[df_applications['Клиент'] == customer_id]
+    total_apps = len(customer_apps)
+    successful_apps = customer_apps['target'].sum() if 'target' in customer_apps.columns else 0
+    conversion_rate = successful_apps / total_apps if total_apps > 0 else 0
+
+    customer = df_customers[df_customers['customer_id'] == customer_id]
+    if len(customer) > 0:
+        c = customer.iloc[0]
+        return {
+            'total_applications': total_apps,
+            'successful_applications': successful_apps,
+            'conversion_rate': conversion_rate,
+            'avg_contract_amount': c.get('avg_contract_amount', 0),
+            'contract_count': c.get('contract_count', 0),
+            'contract_signed_rate': c.get('contract_signed_rate', 0),
+            'avg_order_quantity': c.get('avg_order_quantity', 0),
+            'customer_avg_purchase_cost': c.get('customer_avg_purchase_cost', 0),
+            'avg_contract_payment_sum': c.get('avg_contract_payment_sum', 0)
+        }
+    else:
+        return {
+            'total_applications': total_apps,
+            'successful_applications': successful_apps,
+            'conversion_rate': conversion_rate,
+            'avg_contract_amount': 0,
+            'contract_count': 0,
+            'contract_signed_rate': 0,
+            'avg_order_quantity': 0,
+            'customer_avg_purchase_cost': 0,
+            'avg_contract_payment_sum': 0
+        }
+
+def get_manager_history_enhanced(manager_id):
+    manager_apps = df_applications[df_applications['Менеджер'] == manager_id]
+    total_handled = len(manager_apps)
+    successful_handled = manager_apps['target'].sum() if 'target' in manager_apps.columns else 0
+    conversion_rate = successful_handled / total_handled if total_handled > 0 else 0
+
+    manager_contracts = customer_contracts[customer_contracts['document_manager'] == manager_id] if len(customer_contracts) > 0 else pd.DataFrame()
+    avg_contract_amount = manager_contracts['document_amount'].mean() if len(manager_contracts) > 0 else 0
+    contracts_count = len(manager_contracts)
+
+    return {
+        'total_handled': total_handled,
+        'manager_conversion_rate': conversion_rate,
+        'manager_avg_contract_amount': avg_contract_amount,
+        'manager_contracts_count': contracts_count
+    }
+
+# ---- 7. ФОРМИРУЕМ ФИНАЛЬНЫЙ DATASET ----
+print("\n5. Формирование финального набора признаков...")
+
+customer_dict = df_customers.set_index('customer_id').to_dict('index')
+manager_dict = df_managers.set_index('manager_id')['manager_specialization'].to_dict()
+
+df_features = df_applications.copy()
+
+# Добавляем признаки из справочников
+df_features['customer_type'] = df_features['Клиент'].map(lambda x: customer_dict.get(x, {}).get('customer_type', 'unknown'))
+df_features['customer_status'] = df_features['Клиент'].map(lambda x: customer_dict.get(x, {}).get('customer_status', 'unknown'))
+df_features['manager_specialization'] = df_features['Менеджер'].map(lambda x: manager_dict.get(x, 'unknown'))
+
+# Добавляем исторические признаки
+print("   Расчет расширенной истории клиентов...")
+customer_history_enhanced = {}
+for customer_id in df_applications['Клиент'].unique():
+    customer_history_enhanced[customer_id] = get_customer_history_enhanced(customer_id)
+
+print("   Расчет расширенной истории менеджеров...")
+manager_history_enhanced = {}
+for manager_id in df_applications['Менеджер'].unique():
+    manager_history_enhanced[manager_id] = get_manager_history_enhanced(manager_id)
+
+# Применяем исторические признаки
+df_features['total_applications'] = df_features['Клиент'].map(lambda x: customer_history_enhanced.get(x, {}).get('total_applications', 0))
+df_features['successful_applications'] = df_features['Клиент'].map(lambda x: customer_history_enhanced.get(x, {}).get('successful_applications', 0))
+df_features['conversion_rate'] = df_features['Клиент'].map(lambda x: customer_history_enhanced.get(x, {}).get('conversion_rate', 0))
+df_features['avg_contract_amount'] = df_features['Клиент'].map(lambda x: customer_history_enhanced.get(x, {}).get('avg_contract_amount', 0))
+df_features['contract_count'] = df_features['Клиент'].map(lambda x: customer_history_enhanced.get(x, {}).get('contract_count', 0))
+df_features['contract_signed_rate'] = df_features['Клиент'].map(lambda x: customer_history_enhanced.get(x, {}).get('contract_signed_rate', 0))
+df_features['avg_order_quantity'] = df_features['Клиент'].map(lambda x: customer_history_enhanced.get(x, {}).get('avg_order_quantity', 0))
+df_features['customer_avg_purchase_cost'] = df_features['Клиент'].map(lambda x: customer_history_enhanced.get(x, {}).get('customer_avg_purchase_cost', 0))
+df_features['avg_contract_payment_sum'] = df_features['Клиент'].map(lambda x: customer_history_enhanced.get(x, {}).get('avg_contract_payment_sum', 0))
+
+df_features['total_handled'] = df_features['Менеджер'].map(lambda x: manager_history_enhanced.get(x, {}).get('total_handled', 0))
+df_features['manager_conversion_rate'] = df_features['Менеджер'].map(lambda x: manager_history_enhanced.get(x, {}).get('manager_conversion_rate', 0))
+df_features['manager_avg_contract_amount'] = df_features['Менеджер'].map(lambda x: manager_history_enhanced.get(x, {}).get('manager_avg_contract_amount', 0))
+df_features['manager_contracts_count'] = df_features['Менеджер'].map(lambda x: manager_history_enhanced.get(x, {}).get('manager_contracts_count', 0))
+
+# Извлекаем признаки из текста
+print("   Извлечение признаков из текста заявок...")
+df_features['equipment_category'] = df_features['Содержание заявки'].apply(extract_equipment_type)
+df_features['urgency'] = df_features['Содержание заявки'].apply(extract_urgency)
+df_features['politeness_score'] = df_features['Содержание заявки'].apply(extract_politeness)
+df_features['request_quantity'] = df_features['Содержание заявки'].apply(extract_quantity)
+
+# Временные признаки с безопасной конвертацией (НЕ исправляем будущие даты)
+print("   Добавление временных признаков...")
+df_features['Дата поступления'] = pd.to_datetime(df_features['Дата поступления'], errors='coerce')
+
+# Заполняем только пропущенные даты текущей датой
+df_features['Дата поступления'] = df_features['Дата поступления'].fillna(pd.Timestamp.now())
+
+# Извлекаем признаки
+df_features['hour'] = df_features['Дата поступления'].dt.hour.fillna(12).astype(int)
+df_features['day_of_week'] = df_features['Дата поступления'].dt.dayofweek.fillna(0).astype(int)
+df_features['is_weekend'] = (df_features['day_of_week'] >= 5).astype(int)
+df_features['days_since_start'] = (df_features['Дата поступления'] - pd.Timestamp('2024-01-01')).dt.days.fillna(0).astype(int)
+
+# ---- 8. ОТБИРАЕМ ПРИЗНАКИ ДЛЯ МОДЕЛИ ----
+keep_cols = ['Источник', 'customer_type', 'customer_status', 'manager_specialization',
+             'equipment_category', 'urgency', 'politeness_score', 'request_quantity',
+             'total_applications', 'successful_applications', 'conversion_rate',
+             'avg_contract_amount', 'contract_count', 'contract_signed_rate',
+             'avg_order_quantity', 'customer_avg_purchase_cost', 'avg_contract_payment_sum',
+             'total_handled', 'manager_conversion_rate', 'manager_avg_contract_amount', 'manager_contracts_count',
+             'hour', 'day_of_week', 'is_weekend', 'days_since_start', 'target']
+
+df_features = df_features[keep_cols]
+
+print(f"\n Сформировано {len(df_features)} записей")
+print(f"\n Количество признаков: {len(keep_cols)-1}")
+
+# ---- 9. КОДИРОВАНИЕ КАТЕГОРИАЛЬНЫХ ПРИЗНАКОВ ----
+print("\n6. Кодирование категориальных признаков...")
+categorical_cols = ['Источник', 'customer_type', 'customer_status', 'manager_specialization', 'equipment_category']
+label_encoders = {}
+
+for col in categorical_cols:
+    le = LabelEncoder()
+    df_features[col] = df_features[col].fillna('unknown').astype(str)
+    df_features[col + '_encoded'] = le.fit_transform(df_features[col])
+    label_encoders[col] = le
+    df_features = df_features.drop(columns=[col])
+
+# ---- 10. ПОДГОТОВКА X и y ----
+feature_cols = [col for col in df_features.columns if col != 'target']
+X = df_features[feature_cols]
+y = df_features['target']
+
+feature_names_ru = {
+    # Исходные ключи (без _encoded) для вывода в ячейке 5
+    'Источник': 'Источник',
+    'customer_type': 'Тип клиента',
+    'customer_status': 'Статус клиента',
+    'manager_specialization': 'Специализация менеджера',
+    'equipment_category': 'Категория оборудования',
+    'urgency': 'Срочность заявки',
+    'politeness_score': 'Вежливость заявки',
+    'request_quantity': 'Запрошенное количество',
+    'total_applications': 'Всего заявок клиента',
+    'successful_applications': 'Успешных заявок клиента',
+    'conversion_rate': 'Конверсия клиента',
+    'avg_contract_amount': 'Средняя сумма договора клиента',
+    'contract_count': 'Количество договоров клиента',
+    'contract_signed_rate': 'Доля подписанных договоров',
+    'avg_order_quantity': 'Среднее количество товаров в договоре',
+    'customer_avg_purchase_cost': 'Средняя стоимость покупки клиента',
+    'avg_contract_payment_sum': 'Средняя сумма платежей по договору',
+    'total_handled': 'Заявок у менеджера',
+    'manager_conversion_rate': 'Конверсия менеджера',
+    'manager_avg_contract_amount': 'Средняя сумма договоров менеджера',
+    'manager_contracts_count': 'Количество договоров менеджера',
+    'hour': 'Час поступления',
+    'day_of_week': 'День недели',
+    'is_weekend': 'Выходной день',
+    'days_since_start': 'Дней с начала периода',
+
+    # Закодированные ключи (для SHAP и модели)
+    'Источник_encoded': 'Источник заявки',
+    'customer_type_encoded': 'Тип клиента',
+    'customer_status_encoded': 'Статус клиента',
+    'manager_specialization_encoded': 'Специализация менеджера',
+    'equipment_category_encoded': 'Категория техники',
+}
+
+print(f"\n Размерность X: {X.shape}")
+print(f"\n Количество признаков: {len(feature_cols)}")
+print(f"\n =============== Подготовка данных завершена ==============")
+
+############################ ячейка 4 - обучение ML-модели и оценка качества #######################
+
+# ========== 1. ПОДГОТОВКА ДАТ  ==========
+print("\n1. Приведение дат к единому формату...")
+
+# Даты заявок
+if 'Дата поступления' in df_applications.columns:
+    df_applications['app_date_dt'] = pd.to_datetime(df_applications['Дата поступления'], errors='coerce')
+else:
+    raise KeyError("В df_applications нет столбца 'Дата поступления'")
+
+# Даты документов (договоров)
+if 'document_date' in df_documents.columns:
+    df_documents['doc_date_dt'] = pd.to_datetime(df_documents['document_date'], errors='coerce')
+else:
+    raise KeyError("В df_documents нет столбца 'document_date'")
+
+# Даты платежей
+df_payments['Дата'] = pd.to_datetime(df_payments['Дата'], errors='coerce')
+
+
+# ========== 2. ФОРМИРОВАНИЕ ВЫБОРКИ ТОЛЬКО ИЗ ЗАЯВОК С КОНВЕРСИЕЙ ==========
+print("\n2. Формирование целевой переменной для регрессии...")
+
+# Берём только заявки, которые привели к договору (target == 1)
+reg_applications = df_applications[df_applications['target'] == 1].copy()
+print(f"   Заявок с конверсией: {len(reg_applications)}")
+
+# Создаём список договоров клиентов (для связывания)
+customer_contracts = df_documents[
+    (df_documents['document_kind'] == 'Договор') &
+    (df_documents['counterparty_type'] == 'Клиент')
+].copy()
+# Убедимся, что даты договоров у нас есть (doc_date_dt уже добавлен)
+print(f"   Договоров клиентов: {len(customer_contracts)}")
+
+# Словарь: номер заявки -> сумма договора
+app_to_amount = {}
+
+for idx, app in reg_applications.iterrows():
+    app_number = app['Номер']
+    customer_id = app['Клиент']
+    app_date = app['app_date_dt']
+    if pd.isna(app_date):
+        continue
+
+    # Находим клиента по ID
+    cust_row = df_customers[df_customers['customer_id'] == customer_id]
+    if len(cust_row) == 0:
+        continue
+    cust_inn = cust_row.iloc[0]['customer_inn']
+    cust_name = cust_row.iloc[0]['customer_name']
+
+    # Ищем договоры этого клиента
+    mask = (customer_contracts['counterparty_inn'] == cust_inn) | (customer_contracts['counterparty_name'] == cust_name)
+    contracts_of_customer = customer_contracts[mask].copy()
+    if len(contracts_of_customer) == 0:
+        continue
+
+    # Вычисляем разницу в днях (только договоры после или в день заявки)
+    contracts_of_customer['date_diff'] = (contracts_of_customer['doc_date_dt'] - app_date).dt.days
+    valid = contracts_of_customer[contracts_of_customer['date_diff'] >= 0]
+    if len(valid) == 0:
+        continue
+
+    best = valid.loc[valid['date_diff'].idxmin()]
+    amount = best['document_amount']
+    if pd.notna(amount) and amount > 0:
+        app_to_amount[app_number] = amount
+
+# Добавляем целевую переменную
+reg_applications['contract_amount'] = reg_applications['Номер'].map(app_to_amount)
+reg_applications = reg_applications[reg_applications['contract_amount'].notna()].copy()
+print(f"   Заявок с известной суммой договора: {len(reg_applications)}")
+if len(reg_applications) > 0:
+    print(f"   Распределение сумм: мин={reg_applications['contract_amount'].min():.0f}, "
+          f"медиана={reg_applications['contract_amount'].median():.0f}, "
+          f"среднее={reg_applications['contract_amount'].mean():.0f}, "
+          f"макс={reg_applications['contract_amount'].max():.0f}")
+
+reg_applications['contract_amount_log'] = np.log1p(reg_applications['contract_amount'])
+
+# ========== 3. ФУНКЦИИ ДЛЯ РАСЧЕТА ИСТОРИИ (БЕЗ УТЕЧЕК) ==========
+def get_customer_history_reg(customer_id, current_app_date, current_app_number=None):
+    """Возвращает историю клиента по ЗАЯВКАМ и ДОГОВОРАМ, которые были ДО current_app_date"""
+    if not isinstance(current_app_date, pd.Timestamp):
+        current_app_date = pd.to_datetime(current_app_date)
+
+    # Заявки клиента до указанной даты
+    customer_apps = df_applications[
+        (df_applications['Клиент'] == customer_id) &
+        (df_applications['app_date_dt'].notna()) &
+        (df_applications['app_date_dt'] < current_app_date)
+    ].copy()
+    if current_app_number:
+        customer_apps = customer_apps[customer_apps['Номер'] != current_app_number]
+
+    total_apps = len(customer_apps)
+    successful = sum(1 for _, app in customer_apps.iterrows() if app['Номер'] in app_to_amount)
+    conversion_rate = successful / total_apps if total_apps > 0 else 0
+
+    # Данные клиента (ИНН, название)
+    cust_row = df_customers[df_customers['customer_id'] == customer_id]
+    if len(cust_row) == 0:
+        return default_customer_history()
+    cust_inn = cust_row.iloc[0]['customer_inn']
+    cust_name = cust_row.iloc[0]['customer_name']
+
+    # Договоры клиента до даты (используем глобальный customer_contracts, но с учётом дат)
+    hist_contracts = customer_contracts[
+        ((customer_contracts['counterparty_inn'] == cust_inn) |
+         (customer_contracts['counterparty_name'] == cust_name)) &
+        (customer_contracts['doc_date_dt'].notna()) &
+        (customer_contracts['doc_date_dt'] < current_app_date)
+    ].copy()
+
+    amounts = hist_contracts['document_amount'].dropna()
+    avg_amount = amounts.mean() if len(amounts) > 0 else 0
+    contract_count = len(amounts)
+    signed = (hist_contracts['document_status'] == 'подписан').sum() if len(hist_contracts) > 0 else 0
+    signed_rate = signed / len(hist_contracts) if len(hist_contracts) > 0 else 0
+
+    # Содержимое договоров
+    avg_order_qty = 0
+    if len(hist_contracts) > 0 and len(df_contracts_content) > 0:
+        merged = hist_contracts.merge(
+            df_contracts_content,
+            left_on='document_number',
+            right_on='contract_number',
+            how='inner'
+        )
+        if len(merged) > 0:
+            avg_order_qty = merged.groupby('document_number')['quantity'].sum().mean()
+
+    # Платежи по договорам
+    avg_payment = 0
+    if len(hist_contracts) > 0 and len(df_payments) > 0:
+        incoming = df_payments[df_payments['Тип'] == 'Входящий'].copy()
+        if 'Дата' in incoming.columns:
+            incoming['Дата'] = pd.to_datetime(incoming['Дата'], errors='coerce')
+            payments_before = incoming[incoming['Дата'] < current_app_date]
+            contract_payments = []
+            for doc_num in hist_contracts['document_number']:
+                paid = payments_before[payments_before['Основание'] == doc_num]['Сумма'].sum()
+                if paid > 0:
+                    contract_payments.append(paid)
+            avg_payment = np.mean(contract_payments) if contract_payments else 0
+
+    return {
+        'total_applications': total_apps,
+        'successful_applications': successful,
+        'conversion_rate': conversion_rate,
+        'avg_contract_amount': avg_amount,
+        'contract_count': contract_count,
+        'contract_signed_rate': signed_rate,
+        'avg_order_quantity': avg_order_qty,
+        'avg_contract_payment_sum': avg_payment
+    }
+
+def default_customer_history():
+    return {
+        'total_applications': 0,
+        'successful_applications': 0,
+        'conversion_rate': 0,
+        'avg_contract_amount': 0,
+        'contract_count': 0,
+        'contract_signed_rate': 0,
+        'avg_order_quantity': 0,
+        'avg_contract_payment_sum': 0
+    }
+
+def get_manager_history_reg(manager_id, current_app_date):
+    """История менеджера по заявкам ДО указанной даты"""
+    if not isinstance(current_app_date, pd.Timestamp):
+        current_app_date = pd.to_datetime(current_app_date)
+
+    manager_apps = df_applications[
+        (df_applications['Менеджер'] == manager_id) &
+        (df_applications['app_date_dt'].notna()) &
+        (df_applications['app_date_dt'] < current_app_date)
+    ].copy()
+    total = len(manager_apps)
+    successful = sum(1 for _, app in manager_apps.iterrows() if app['Номер'] in app_to_amount)
+    conv_rate = successful / total if total > 0 else 0
+
+    amounts = [app_to_amount[app['Номер']] for _, app in manager_apps.iterrows() if app['Номер'] in app_to_amount]
+    avg_amount = np.mean(amounts) if amounts else 0
+    contracts_count = len(amounts)
+
+    return {
+        'total_handled': total,
+        'manager_conversion_rate': conv_rate,
+        'manager_avg_contract_amount': avg_amount,
+        'manager_contracts_count': contracts_count
+    }
+
+# ========== 4. РАСЧЁТ ПРИЗНАКОВ ДЛЯ КАЖДОЙ ЗАЯВКИ ==========
+print("\n3. Формирование признаков для регрессии...")
+if len(reg_applications) == 0:
+    raise ValueError("Нет заявок с конверсией для обучения регрессии!")
+
+customer_hist_dict = {}
+manager_hist_dict = {}
+
+for idx, row in reg_applications.iterrows():
+    cust_id = row['Клиент']
+    mgr_id = row['Менеджер']
+    app_date = row['app_date_dt']
+    app_num = row['Номер']
+    customer_hist_dict[(cust_id, app_date, app_num)] = get_customer_history_reg(cust_id, app_date, app_num)
+    manager_hist_dict[(mgr_id, app_date)] = get_manager_history_reg(mgr_id, app_date)
+
+# Добавляем признаки
+reg_applications['total_applications'] = reg_applications.apply(
+    lambda r: customer_hist_dict.get((r['Клиент'], r['app_date_dt'], r['Номер']), default_customer_history())['total_applications'], axis=1)
+reg_applications['successful_applications'] = reg_applications.apply(
+    lambda r: customer_hist_dict.get((r['Клиент'], r['app_date_dt'], r['Номер']), default_customer_history())['successful_applications'], axis=1)
+reg_applications['conversion_rate'] = reg_applications.apply(
+    lambda r: customer_hist_dict.get((r['Клиент'], r['app_date_dt'], r['Номер']), default_customer_history())['conversion_rate'], axis=1)
+reg_applications['avg_contract_amount'] = reg_applications.apply(
+    lambda r: customer_hist_dict.get((r['Клиент'], r['app_date_dt'], r['Номер']), default_customer_history())['avg_contract_amount'], axis=1)
+reg_applications['contract_count'] = reg_applications.apply(
+    lambda r: customer_hist_dict.get((r['Клиент'], r['app_date_dt'], r['Номер']), default_customer_history())['contract_count'], axis=1)
+reg_applications['contract_signed_rate'] = reg_applications.apply(
+    lambda r: customer_hist_dict.get((r['Клиент'], r['app_date_dt'], r['Номер']), default_customer_history())['contract_signed_rate'], axis=1)
+reg_applications['avg_order_quantity'] = reg_applications.apply(
+    lambda r: customer_hist_dict.get((r['Клиент'], r['app_date_dt'], r['Номер']), default_customer_history())['avg_order_quantity'], axis=1)
+reg_applications['avg_contract_payment_sum'] = reg_applications.apply(
+    lambda r: customer_hist_dict.get((r['Клиент'], r['app_date_dt'], r['Номер']), default_customer_history())['avg_contract_payment_sum'], axis=1)
+
+reg_applications['total_handled'] = reg_applications.apply(
+    lambda r: manager_hist_dict.get((r['Менеджер'], r['app_date_dt']), {}).get('total_handled', 0), axis=1)
+reg_applications['manager_conversion_rate'] = reg_applications.apply(
+    lambda r: manager_hist_dict.get((r['Менеджер'], r['app_date_dt']), {}).get('manager_conversion_rate', 0), axis=1)
+reg_applications['manager_avg_contract_amount'] = reg_applications.apply(
+    lambda r: manager_hist_dict.get((r['Менеджер'], r['app_date_dt']), {}).get('manager_avg_contract_amount', 0), axis=1)
+reg_applications['manager_contracts_count'] = reg_applications.apply(
+    lambda r: manager_hist_dict.get((r['Менеджер'], r['app_date_dt']), {}).get('manager_contracts_count', 0), axis=1)
+
+# Текстовые признаки (функции из ячейки 3, должны быть доступны)
+reg_applications['equipment_category'] = reg_applications['Содержание заявки'].apply(extract_equipment_type)
+reg_applications['urgency'] = reg_applications['Содержание заявки'].apply(extract_urgency)
+reg_applications['politeness_score'] = reg_applications['Содержание заявки'].apply(extract_politeness)
+reg_applications['request_quantity'] = reg_applications['Содержание заявки'].apply(extract_quantity)
+
+# Временные признаки
+reg_applications['hour'] = reg_applications['app_date_dt'].dt.hour.fillna(12).astype(int)
+reg_applications['day_of_week'] = reg_applications['app_date_dt'].dt.dayofweek.fillna(0).astype(int)
+reg_applications['is_weekend'] = (reg_applications['day_of_week'] >= 5).astype(int)
+reg_applications['days_since_start'] = (reg_applications['app_date_dt'] - pd.Timestamp('2024-01-01')).dt.days.fillna(0).astype(int)
+
+# Категориальные признаки из справочников
+reg_applications['customer_type'] = reg_applications['Клиент'].map(
+    lambda x: df_customers.set_index('customer_id').get(x, {}).get('customer_type', 'unknown'))
+reg_applications['customer_status'] = reg_applications['Клиент'].map(
+    lambda x: df_customers.set_index('customer_id').get(x, {}).get('customer_status', 'unknown'))
+reg_applications['manager_specialization'] = reg_applications['Менеджер'].map(
+    lambda x: df_managers.set_index('manager_id').get(x, {}).get('manager_specialization', 'unknown'))
+
+# ========== 5. ПОДГОТОВКА МАТРИЦЫ ПРИЗНАКОВ ==========
+print("\n4. Подготовка матрицы признаков...")
+keep_cols = ['Источник', 'customer_type', 'customer_status', 'manager_specialization',
+             'equipment_category', 'urgency', 'politeness_score', 'request_quantity',
+             'total_applications', 'successful_applications', 'conversion_rate',
+             'avg_contract_amount', 'contract_count', 'contract_signed_rate',
+             'avg_order_quantity', 'avg_contract_payment_sum',
+             'total_handled', 'manager_conversion_rate', 'manager_avg_contract_amount', 'manager_contracts_count',
+             'hour', 'day_of_week', 'is_weekend', 'days_since_start',
+             'contract_amount_log']
+
+reg_features = reg_applications[keep_cols].copy()
+
+# Кодирование категориальных
+categorical_cols_reg = ['Источник', 'customer_type', 'customer_status', 'manager_specialization', 'equipment_category']
+label_encoders_reg = {}
+for col in categorical_cols_reg:
+    le = LabelEncoder()
+    reg_features[col] = reg_features[col].fillna('unknown').astype(str)
+    reg_features[col + '_encoded'] = le.fit_transform(reg_features[col])
+    label_encoders_reg[col] = le
+    reg_features = reg_features.drop(columns=[col])
+
+feature_cols_reg = [col for col in reg_features.columns if col != 'contract_amount_log']
+X_reg = reg_features[feature_cols_reg]
+y_reg = reg_features['contract_amount_log']
+
+print(f"   Размер выборки: {X_reg.shape[0]}, признаков: {X_reg.shape[1]}")
+
+# ========== 6. РАЗДЕЛЕНИЕ И ОБУЧЕНИЕ ==========
+X_train_reg, X_test_reg, y_train_reg, y_test_reg = train_test_split(
+    X_reg, y_reg, test_size=0.2, random_state=42
+)
+print(f"   Обучающая: {X_train_reg.shape[0]}, тестовая: {X_test_reg.shape[0]}")
+
+print("\n5. Обучение XGBoost регрессора...")
+reg_model = xgb.XGBRegressor(
+    n_estimators=200,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    objective='reg:squarederror'
+)
+
+reg_model.fit(X_train_reg, y_train_reg,
+              eval_set=[(X_test_reg, y_test_reg)],
+              verbose=False)
+
+# Предсказания
+y_pred_log = reg_model.predict(X_test_reg)
+y_pred = np.expm1(y_pred_log)
+y_true = np.expm1(y_test_reg)
+
+# ========== 7. МЕТРИКИ И ГРАФИКИ ==========
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+mae = mean_absolute_error(y_true, y_pred)
+rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6))) * 100
+r2 = r2_score(y_true, y_pred)
+
+print("\n ================= МЕТРИКИ КАЧЕСТВА РЕГРЕССИИ ================")
+print(f"\n  MAE (Mean Absolute Error, средняя абсолютная ошибка предсказания) \n показывает, насколько в среднем модель ошибается. \n Измеряется в тех же единицах, что и целевая (прогнозируемая) переменная. \n MAE = {mae:,.0f} руб. \n ")
+print(f"\n  RMSE (Root Mean Squared Error, квадратный корень из среднеквадратичной ошибки) \n показывает, насколько сильно в среднем предсказания модели отклоняются от реальных значений.\n Измеряется в тех же единицах, что и целевая (прогнозируемая) переменная, особенно чувствительна к сильным ошибкам (выбросам). \n RMSE = {rmse:,.0f} руб. \n")
+print(f"\n  MAPE (Mean Absolute Percentage Error, средняя абсолютная процентная ошибка)\n показывает, на сколько процентов в среднем предсказание отклоняется от факта.\n Полезна для сравнения моделей на разных масштабах. \n MAPE = {mape:.1f}%")
+print(f"  R²:   {r2:.4f}")
+
+# График реальных vs предсказанных
+plt.figure(figsize=(10, 6))
+plt.scatter(y_true, y_pred, alpha=0.5, edgecolors='k', linewidth=0.5)
+plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--', lw=2)
+plt.xlabel('Реальная сумма (руб.)')
+plt.ylabel('Предсказанная сумма (руб.)')
+plt.title('Реальные vs предсказанные суммы договоров')
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Гистограмма ошибок
+errors = y_pred - y_true
+plt.figure(figsize=(10, 5))
+plt.hist(errors, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
+plt.axvline(x=0, color='red', linestyle='--', lw=2)
+plt.xlabel('Ошибка (руб.)')
+plt.ylabel('Частота')
+plt.title('Распределение ошибок предсказания')
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Важность признаков
+feature_importance_reg = pd.DataFrame({
+    'feature': feature_cols_reg,
+    'importance': reg_model.feature_importances_
+}).sort_values('importance', ascending=False)
+
+# Словарь для перевода названий признаков на русский
+feature_names_ru_reg = {
+    'Источник_encoded': 'Источник заявки',
+    'customer_type_encoded': 'Тип клиента',
+    'customer_status_encoded': 'Статус клиента',
+    'manager_specialization_encoded': 'Специализация менеджера',
+    'equipment_category_encoded': 'Категория техники',
+    'urgency': 'Срочность заявки',
+    'politeness_score': 'Вежливость заявки',
+    'request_quantity': 'Запрошенное количество',
+    'total_applications': 'Всего заявок клиента',
+    'successful_applications': 'Успешных заявок клиента',
+    'conversion_rate': 'Конверсия клиента',
+    'avg_contract_amount': 'Средняя сумма договора клиента',
+    'contract_count': 'Количество договоров клиента',
+    'contract_signed_rate': 'Доля подписанных договоров',
+    'avg_order_quantity': 'Среднее количество товаров в договоре',
+    'avg_contract_payment_sum': 'Средняя сумма платежей по договору',
+    'total_handled': 'Заявок у менеджера',
+    'manager_conversion_rate': 'Конверсия менеджера',
+    'manager_avg_contract_amount': 'Средняя сумма договоров менеджера',
+    'manager_contracts_count': 'Количество договоров менеджера',
+    'hour': 'Час поступления',
+    'day_of_week': 'День недели',
+    'is_weekend': 'Выходной день',
+    'days_since_start': 'Дней с начала периода',
+}
+
+print("\n ============ Топ-10 важных признаков: ==============")
+for i, row in feature_importance_reg.head(10).iterrows():
+    rus_name = feature_names_ru_reg.get(row['feature'], row['feature'])
+    print(f"   • {rus_name:<35} {row['importance']:.4f}")
+
+plt.figure(figsize=(12, 8))
+top10 = feature_importance_reg.head(10)
+# Преобразуем названия признаков в русские
+top10_names_rus = [feature_names_ru_reg.get(f, f) for f in top10['feature']]
+plt.barh(range(len(top10)), top10['importance'], color='teal', alpha=0.7)
+plt.yticks(range(len(top10)), top10_names_rus)
+plt.xlabel('Важность')
+plt.title('Топ-10 важных признаков для предсказания суммы')
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.show()
+
+# ========== 8. ФУНКЦИЯ ПРЕДСКАЗАНИЯ ДЛЯ НОВОЙ ЗАЯВКИ ==========
+def predict_contract_amount(customer_id, manager_id, source, content, date=None, verbose=False):
+    if date is None:
+        date = pd.Timestamp.now()
+    else:
+        date = pd.to_datetime(date)
+
+    cust_hist = get_customer_history_reg(customer_id, date, current_app_number=None)
+    mgr_hist = get_manager_history_reg(manager_id, date)
+
+    equipment_cat = extract_equipment_type(content)
+    urgency = extract_urgency(content)
+    politeness = extract_politeness(content)
+    quantity = extract_quantity(content)
+
+    cust_row = df_customers[df_customers['customer_id'] == customer_id]
+    customer_type = cust_row['customer_type'].iloc[0] if len(cust_row) > 0 else 'unknown'
+    customer_status = cust_row['customer_status'].iloc[0] if len(cust_row) > 0 else 'unknown'
+
+    mgr_row = df_managers[df_managers['manager_id'] == manager_id]
+    manager_spec = mgr_row['manager_specialization'].iloc[0] if len(mgr_row) > 0 else 'unknown'
+
+    hour = date.hour
+    day_of_week = date.dayofweek
+    is_weekend = 1 if day_of_week >= 5 else 0
+    days_since_start = (date - pd.Timestamp('2024-01-01')).days
+
+    features_dict = {
+        'Источник': source,
+        'customer_type': customer_type,
+        'customer_status': customer_status,
+        'manager_specialization': manager_spec,
+        'equipment_category': equipment_cat,
+        'urgency': urgency,
+        'politeness_score': politeness,
+        'request_quantity': quantity,
+        'total_applications': cust_hist['total_applications'],
+        'successful_applications': cust_hist['successful_applications'],
+        'conversion_rate': cust_hist['conversion_rate'],
+        'avg_contract_amount': cust_hist['avg_contract_amount'],
+        'contract_count': cust_hist['contract_count'],
+        'contract_signed_rate': cust_hist['contract_signed_rate'],
+        'avg_order_quantity': cust_hist['avg_order_quantity'],
+        'avg_contract_payment_sum': cust_hist['avg_contract_payment_sum'],
+        'total_handled': mgr_hist['total_handled'],
+        'manager_conversion_rate': mgr_hist['manager_conversion_rate'],
+        'manager_avg_contract_amount': mgr_hist['manager_avg_contract_amount'],
+        'manager_contracts_count': mgr_hist['manager_contracts_count'],
+        'hour': hour,
+        'day_of_week': day_of_week,
+        'is_weekend': is_weekend,
+        'days_since_start': days_since_start,
+    }
+
+    df_new = pd.DataFrame([features_dict])
+    for col in categorical_cols_reg:
+        if col in df_new.columns:
+            val = df_new[col].iloc[0]
+            le = label_encoders_reg[col]
+            if 'unknown' not in le.classes_:
+                le.classes_ = np.append(le.classes_, 'unknown')
+            if val not in le.classes_:
+                val = 'unknown'
+            encoded = le.transform([val])[0]
+            df_new[col+'_encoded'] = encoded
+            df_new = df_new.drop(columns=[col])
+        else:
+            le = label_encoders_reg[col]
+            if 'unknown' not in le.classes_:
+                le.classes_ = np.append(le.classes_, 'unknown')
+            df_new[col+'_encoded'] = le.transform(['unknown'])[0]
+
+    X_new = df_new[feature_cols_reg]
+    pred_log = reg_model.predict(X_new)[0]
+    pred_amount = np.expm1(pred_log)
+
+    if verbose:
+        print(f"\n ========  История клиента ===== \n заявок={cust_hist['total_applications']}, "
+              f"успешных = {cust_hist['successful_applications']}, "
+              f"ср.сумма = {cust_hist['avg_contract_amount']:,.0f}")
+        print(f" =========== Прогнозируемая сумма заявки ==== \n {pred_amount:,.0f} руб.")
+    return pred_amount
+
+# Пример предсказания
+print("\n Пример предсказания для первой заявки из тестовой выборки:")
+if len(X_test_reg) > 0:
+    sample = X_test_reg.iloc[[0]]
+    pred_log = reg_model.predict(sample)[0]
+    pred_sum = np.expm1(pred_log)
+    true_sum = np.expm1(y_test_reg.iloc[0])
+    print(f"   Реальная сумма: {true_sum:,.0f} руб.")
+    print(f"   Предсказанная:  {pred_sum:,.0f} руб.")
+    print(f"   Ошибка:         {abs(true_sum - pred_sum):,.0f} руб. ({abs(true_sum - pred_sum)/true_sum*100:.1f}%)")
+
+############################ ячейка 5 - прогноз суммы по случайной заявке ######################
+print("\n ========== ПРОГНОЗ СУММЫ ДОГОВОРА ПО СЛУЧАЙНОЙ ЗАЯВКЕ С ПОМОЩЬЮ РЕГРЕССИОННОЙ МОДЕЛИ ========")
+
+# ============================================================
+# 1. ГЕНЕРАЦИЯ СЛУЧАЙНОЙ ЗАЯВКИ
+# ============================================================
+print("\n1. Генерация случайной заявки...")
+
+# Уникальный номер заявки (для отображения)
+random_num = random.randint(1, 999)
+day = datetime.now().day
+month = datetime.now().month
+year = datetime.now().year
+new_app_number = f"{random_num:03d}-{day:02d}-{month:02d}-{year}"
+
+# Случайный клиент из справочника
+if len(df_customers) > 0:
+    random_client_id = df_customers['customer_id'].sample(n=1).iloc[0]
+    # Получаем имя клиента для красивой печати
+    client_name = df_customers[df_customers['customer_id'] == random_client_id]['customer_name'].iloc[0]
+else:
+    random_client_id = "CUST-UNKNOWN"
+    client_name = "Неизвестный клиент"
+
+# Случайный менеджер из справочника
+if len(df_managers) > 0:
+    random_manager_id = df_managers['manager_id'].sample(n=1).iloc[0]
+    manager_name = df_managers[df_managers['manager_id'] == random_manager_id]['manager_name'].iloc[0]
+else:
+    random_manager_id = "MGR-UNKNOWN"
+    manager_name = "Неизвестный менеджер"
+
+# Случайный источник
+sources = ['сайт', 'телефон', 'мессенджер', 'email', 'личный визит']
+random_source = random.choice(sources)
+
+# Шаблоны текста заявки
+templates = [
+    'Нужна спецтехника: {техника} в количестве {количество} шт.',
+    'Срочно требуются {техника} - {количество} единиц.',
+    'Интересует аренда {техника}, {количество} шт.',
+    'Заявка на покупку {техника}, {количество} штук.',
+    'Подберите {техника} для строительства дороги, нужно {количество}.',
+    'Требуется {техника} для срочных работ, количество {количество}.',
+    'Хочу заказать {техника} - {количество} единиц, желательно с доставкой.',
+    'Срочный заказ: {техника} в количестве {количество}.'
+]
+
+techniques = ['экскаватор', 'погрузчик', 'бульдозер', 'кран', 'грейдер', 'трактор',
+              'самосвал', 'автовышка', 'каток', 'асфальтоукладчик', 'бетономешалка']
+quantities = ['1', '2', '3', '5', '10', '15', '20', '30', '50']
+
+random_template = random.choice(templates)
+random_technique = random.choice(techniques)
+random_quantity = random.choice(quantities)
+
+content = random_template.format(техника=random_technique, количество=random_quantity)
+
+# Иногда добавляем слово "срочно"
+if random.random() < 0.4 and "срочно" not in content.lower():
+    content += " Срочно!"
+
+current_date = datetime.now().strftime('%Y-%m-%d')
+
+print(f"\n =========== Сгенерированная заявка:==============")
+print(f"   Номер:        {new_app_number}")
+print(f"   Клиент:       {random_client_id} ({client_name})")
+print(f"   Менеджер:     {random_manager_id} ({manager_name})")
+print(f"   Источник:     {random_source}")
+print(f"   Содержание:   {content[:100]}{'...' if len(content)>100 else ''}")
+print(f"   Дата:         {current_date}")
+
+# ============================================================
+# 2. ПРЕДСКАЗАНИЕ СУММЫ ДОГОВОРА
+print("\n ============== ПРОГНОЗ ОЖИДАЕМОЙ СУММЫ ДОГОВОРА =========== ")
+
+try:
+    predicted_amount = predict_contract_amount(
+        customer_id=random_client_id,
+        manager_id=random_manager_id,
+        source=random_source,
+        content=content,
+        date=current_date,
+        verbose=True   
+    )
+
+    # Визуализация суммы в удобном формате
+    if predicted_amount >= 1_000_000:
+        amount_str = f"{predicted_amount/1_000_000:.2f} млн руб."
+    elif predicted_amount >= 1_000:
+        amount_str = f"{predicted_amount/1_000:.1f} тыс. руб."
+    else:
+        amount_str = f"{predicted_amount:.0f} руб."
+
+    print(f"\nОжидаемая сумма договора: {predicted_amount:,.0f} руб. ({amount_str})")
+
+    # Категория ожидаемой сделки
+    if predicted_amount >= 10_000_000:
+        category = "Крупная сделка (более 10 млн)"
+        icon = "🔴"
+    elif predicted_amount >= 3_000_000:
+        category = "Средняя сделка (3-10 млн)"
+        icon = "🟠"
+    elif predicted_amount >= 1_000_000:
+        category = "Малая сделка (1-3 млн)"
+        icon = "🟡"
+    else:
+        category = "Микро-сделка (менее 1 млн)"
+        icon = "🟢"
+
+    print(f"   {icon} Категория: {category}")
+
+
+    print("\n ============== БИЗНЕС-РЕКОМЕНДАЦИИ =========")
+
+    if predicted_amount >= 10_000_000:
+        print("\n🔴 КРУПНАЯ СДЕЛКА (высокая маржинальность)")
+        print("   • Требуется согласование с руководством")
+        print("   • Подготовить индивидуальные условия и скидки")
+        print("   • Закрепить за сделкой опытного менеджера (ТОП)")
+        print("   • Обязательный контроль юриста")
+        print("   • Предложить рассрочку платежа или лизинг")
+
+    elif predicted_amount >= 3_000_000:
+        print("\n🟠 СРЕДНЯЯ СДЕЛКА")
+        print("   • Стандартная процедура согласования")
+        print("   • Возможно предложить дополнительные услуги/сервис")
+        print("   • Контроль выполнения в CRM")
+        print("   • Рекомендуется персональный звонок клиенту")
+
+    elif predicted_amount >= 1_000_000:
+        print("\n🟡 МАЛАЯ СДЕЛКА")
+        print("   • Быстрое оформление по шаблону")
+        print("   • Отправка КП в течение дня")
+        print("   • Возможна автоматизация части процесса")
+
+    else:
+        print("\n🟢 МИКРО-СДЕЛКА")
+        print("   • Автоматизированная обработка")
+        print("   • Включить в массовую рассылку")
+        print("   • Обработка в порядке общей очереди")
+
+    # Дополнительный совет в зависимости от срочности
+    if extract_urgency(content):
+        print("\n   ⚠️ Заявка содержит маркеры СРОЧНОСТИ – обработать вне очереди!")
+
+except Exception as e:
+    print(f"\n❌ Ошибка при прогнозировании: {str(e)}")
