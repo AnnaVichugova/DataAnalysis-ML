@@ -64,7 +64,7 @@ if 'Дата' in df_payments.columns:
 print("=== Данные загружены ===\n")
 
 # проверка типа ИНН (строка)
-['customer_inn'] = df_customers['customer_inn'].astype(str)
+df_customers['customer_inn'] = df_customers['customer_inn'].astype(str)
 df_documents['ИНН контрагента'] = df_documents['ИНН контрагента'].astype(str)
 df_payments['ИНН плательщика'] = df_payments['ИНН плательщика'].astype(str)
 
