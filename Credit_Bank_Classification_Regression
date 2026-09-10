@@ -1,3 +1,6 @@
+# Скрипт для запуска в Google Colab (в локальной IDE ставить в venv, убрать !)
+
+
 # 1. Установка и импорт библиотек
 
 !pip install scikit-learn pandas numpy matplotlib seaborn xgboost openpyxl
