@@ -1,0 +1,881 @@
+# Скрипт для запуска в Google Colab (в локальной IDE ставить в venv, убрать !)
+
+# 1. Установка и импорт библиотек
+!pip install scikit-learn pandas numpy matplotlib seaborn plotly
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from scipy.cluster.hierarchy import dendrogram, linkage
+from scipy.spatial.distance import pdist
+
+# 2. Генерация датасета клиентов МСБ
+
+np.random.seed(42)
+
+def generate_client_dataset(n_samples=3000):
+    """Генерация данных клиентов для кластеризации"""
+
+    # Базовые характеристики клиентов
+    business_types = ['IT', 'Торговля', 'Производство', 'Услуги', 'Строительство', 'Логистика', 'Сельское хозяйство']
+    regions = ['Москва', 'Санкт-Петербург', 'Новосибирск', 'Екатеринбург', 'Казань', 'Нижний Новгород', 'Челябинск']
+
+    data = {
+        'client_id': [f'CL_{i:05d}' for i in range(n_samples)],
+        'business_type': np.random.choice(business_types, n_samples),
+        'region': np.random.choice(regions, n_samples),
+
+        # Финансовые показатели
+        'annual_revenue': np.random.uniform(100000, 100000000, n_samples).round(0),
+        'business_age_years': np.random.uniform(1, 20, n_samples).round(1),
+        'employees': np.random.randint(1, 200, n_samples),
+        'profit_margin': np.random.uniform(0.02, 0.35, n_samples).round(3),
+
+        # Кредитная история
+        'credit_score': np.random.randint(300, 850, n_samples),
+        'existing_loans': np.random.randint(0, 5, n_samples),
+        'total_debt': np.random.uniform(0, 50000000, n_samples).round(0),
+        'default_history': np.random.choice([0, 1], n_samples, p=[0.85, 0.15]),
+
+        # Поведенческие метрики
+        'transaction_frequency': np.random.randint(5, 200, n_samples),
+        'average_check': np.random.uniform(1000, 500000, n_samples).round(0),
+        'customer_lifetime_months': np.random.randint(3, 120, n_samples),
+
+        # Запрашиваемый кредит
+        'requested_loan': np.random.uniform(100000, 15000000, n_samples).round(0),
+        'requested_term': np.random.choice([12, 24, 36, 48, 60], n_samples),
+    }
+
+    df = pd.DataFrame(data)
+
+    # Добавляем скрытые кластеры для реалистичности
+    # Кластер 1: Стабильные предприятия с высокой выручкой
+    idx1 = np.random.choice(n_samples, size=int(n_samples*0.25), replace=False)
+    df.loc[idx1, 'annual_revenue'] *= np.random.uniform(2, 5, len(idx1))
+    df.loc[idx1, 'credit_score'] += np.random.randint(50, 150, len(idx1))
+    df.loc[idx1, 'profit_margin'] += np.random.uniform(0.05, 0.15, len(idx1))
+
+    # Кластер 2: Рискованные стартапы
+    idx2 = np.random.choice(n_samples, size=int(n_samples*0.15), replace=False)
+    df.loc[idx2, 'business_age_years'] = np.random.uniform(0.5, 3, len(idx2))
+    df.loc[idx2, 'default_history'] = 1
+    df.loc[idx2, 'credit_score'] -= np.random.randint(50, 150, len(idx2))
+    df.loc[idx2, 'profit_margin'] = np.random.uniform(-0.05, 0.05, len(idx2))
+
+    # Кластер 3: Крупные заемщики
+    idx3 = np.random.choice(n_samples, size=int(n_samples*0.20), replace=False)
+    df.loc[idx3, 'requested_loan'] *= np.random.uniform(2, 4, len(idx3))
+    df.loc[idx3, 'employees'] += np.random.randint(50, 150, len(idx3))
+    df.loc[idx3, 'annual_revenue'] *= np.random.uniform(1.5, 3, len(idx3))
+
+    # Кластер 4: Лояльные клиенты с долгой историей
+    idx4 = np.random.choice(n_samples, size=int(n_samples*0.15), replace=False)
+    df.loc[idx4, 'customer_lifetime_months'] = np.random.randint(60, 120, len(idx4))
+    df.loc[idx4, 'transaction_frequency'] += np.random.randint(50, 100, len(idx4))
+    df.loc[idx4, 'default_history'] = 0
+
+    return df
+
+# Генерируем данные
+df = generate_client_dataset(3000)
+print(f"Сгенерировано {len(df)} клиентов")
+print("\nПервые 5 записей:")
+print(df.head())
+
+# 3. Предобработка данных для кластеризации
+
+# Выбираем признаки для кластеризации
+features_for_clustering = [
+    'annual_revenue',
+    'business_age_years',
+    'employees',
+    'profit_margin',
+    'credit_score',
+    'existing_loans',
+    'total_debt',
+    'default_history',
+    'transaction_frequency',
+    'average_check',
+    'customer_lifetime_months',
+    'requested_loan',
+    'requested_term'
+]
+
+# Кодируем категориальные признаки
+le_business = LabelEncoder()
+le_region = LabelEncoder()
+df['business_type_encoded'] = le_business.fit_transform(df['business_type'])
+df['region_encoded'] = le_region.fit_transform(df['region'])
+
+# Добавляем закодированные признаки
+features_for_clustering.extend(['business_type_encoded', 'region_encoded'])
+
+# Создаем синтетические признаки
+df['debt_to_revenue'] = df['total_debt'] / (df['annual_revenue'] + 1)
+df['loan_to_revenue'] = df['requested_loan'] / (df['annual_revenue'] + 1)
+df['revenue_per_employee'] = df['annual_revenue'] / (df['employees'] + 1)
+df['transaction_activity'] = df['transaction_frequency'] / (df['customer_lifetime_months'] + 1)
+
+features_for_clustering.extend(['debt_to_revenue', 'loan_to_revenue', 'revenue_per_employee', 'transaction_activity'])
+
+# Подготовка данных
+X = df[features_for_clustering].copy()
+
+# Обработка выбросов (логарифмирование)
+for col in ['annual_revenue', 'total_debt', 'requested_loan', 'average_check']:
+    X[f'{col}_log'] = np.log1p(X[col])
+    features_for_clustering.append(f'{col}_log')
+
+# Масштабирование
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+X_scaled_df = pd.DataFrame(X_scaled, columns=X.columns)
+
+print(f"Размерность данных: {X_scaled_df.shape}")
+print(f"Количество признаков: {X_scaled_df.shape[1]}")
+
+# 4. Определение оптимального числа кластеров
+
+# Метод локтя
+inertias = []
+silhouette_scores = []
+calinski_scores = []
+davies_scores = []
+
+K_range = range(2, 11)
+
+for k in K_range:
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(X_scaled_df)
+
+    inertias.append(kmeans.inertia_)
+    silhouette_scores.append(silhouette_score(X_scaled_df, labels))
+    calinski_scores.append(calinski_harabasz_score(X_scaled_df, labels))
+    davies_scores.append(davies_bouldin_score(X_scaled_df, labels))
+
+# Визуализация
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle('Определение оптимального числа кластеров', fontsize=16)
+
+# Метод локтя
+axes[0,0].plot(K_range, inertias, 'bo-', linewidth=2)
+axes[0,0].set_xlabel('Число кластеров')
+axes[0,0].set_ylabel('Инерция')
+axes[0,0].set_title('Метод локтя')
+axes[0,0].grid(True, alpha=0.3)
+
+# Silhouette
+axes[0,1].plot(K_range, silhouette_scores, 'ro-', linewidth=2)
+axes[0,1].set_xlabel('Число кластеров')
+axes[0,1].set_ylabel('Silhouette Score')
+axes[0,1].set_title('Коэффициент силуэта')
+axes[0,1].grid(True, alpha=0.3)
+
+# Calinski-Harabasz
+axes[1,0].plot(K_range, calinski_scores, 'go-', linewidth=2)
+axes[1,0].set_xlabel('Число кластеров')
+axes[1,0].set_ylabel('Calinski-Harabasz Score')
+axes[1,0].set_title('Индекс Калински-Харабаш')
+axes[1,0].grid(True, alpha=0.3)
+
+# Davies-Bouldin
+axes[1,1].plot(K_range, davies_scores, 'mo-', linewidth=2)
+axes[1,1].set_xlabel('Число кластеров')
+axes[1,1].set_ylabel('Davies-Bouldin Score')
+axes[1,1].set_title('Индекс Дэвиса-Болдина')
+axes[1,1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Вывод оптимального числа
+optimal_k = K_range[np.argmax(silhouette_scores)]
+print(f"Оптимальное число кластеров по Silhouette: {optimal_k}")
+print(f"Лучший Silhouette Score: {max(silhouette_scores):.3f}")
+
+# 5. Применение различных алгоритмов кластеризации
+
+# K-Means
+kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
+df['cluster_kmeans'] = kmeans.fit_predict(X_scaled_df)
+
+# Agglomerative
+agglo = AgglomerativeClustering(n_clusters=optimal_k)
+df['cluster_agglo'] = agglo.fit_predict(X_scaled_df)
+
+# DBSCAN (для сравнения)
+dbscan = DBSCAN(eps=0.5, min_samples=10)
+df['cluster_dbscan'] = dbscan.fit_predict(X_scaled_df)
+
+# Оценка качества
+print("Качество кластеризации:")
+print("\nK-Means:")
+print(f"Silhouette Score: {silhouette_score(X_scaled_df, df['cluster_kmeans']):.3f}")
+print(f"Calinski-Harabasz: {calinski_harabasz_score(X_scaled_df, df['cluster_kmeans']):.3f}")
+print(f"Davies-Bouldin: {davies_bouldin_score(X_scaled_df, df['cluster_kmeans']):.3f}")
+
+print("\nAgglomerative:")
+print(f"Silhouette Score: {silhouette_score(X_scaled_df, df['cluster_agglo']):.3f}")
+print(f"Calinski-Harabasz: {calinski_harabasz_score(X_scaled_df, df['cluster_agglo']):.3f}")
+print(f"Davies-Bouldin: {davies_bouldin_score(X_scaled_df, df['cluster_agglo']):.3f}")
+
+# DBSCAN (игнорируем шум)
+valid_dbscan = df[df['cluster_dbscan'] != -1]
+if len(valid_dbscan) > 0:
+    print(f"\nDBSCAN (исключая шум, {len(valid_dbscan)} точек):")
+    print(f"Silhouette Score: {silhouette_score(X_scaled_df[df['cluster_dbscan'] != -1], valid_dbscan['cluster_dbscan']):.3f}")
+    print(f"Количество кластеров: {len(set(df['cluster_dbscan'])) - 1}")
+
+
+# 6. Визуализация кластеров
+
+# PCA для снижения размерности
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled_df)
+
+df['pca_1'] = X_pca[:, 0]
+df['pca_2'] = X_pca[:, 1]
+
+# t-SNE для лучшей визуализации
+tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+X_tsne = tsne.fit_transform(X_scaled_df)
+
+df['tsne_1'] = X_tsne[:, 0]
+df['tsne_2'] = X_tsne[:, 1]
+
+# Визуализация
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig.suptitle('Визуализация кластеров клиентов МСБ', fontsize=16)
+
+# K-Means PCA
+scatter1 = axes[0,0].scatter(df['pca_1'], df['pca_2'], c=df['cluster_kmeans'],
+                              cmap='viridis', alpha=0.6, s=30)
+axes[0,0].set_title(f'K-Means (PCA, {optimal_k} кластеров)')
+axes[0,0].set_xlabel('PCA 1')
+axes[0,0].set_ylabel('PCA 2')
+plt.colorbar(scatter1, ax=axes[0,0])
+
+# Agglomerative PCA
+scatter2 = axes[0,1].scatter(df['pca_1'], df['pca_2'], c=df['cluster_agglo'],
+                              cmap='plasma', alpha=0.6, s=30)
+axes[0,1].set_title(f'Agglomerative (PCA, {optimal_k} кластеров)')
+axes[0,1].set_xlabel('PCA 1')
+axes[0,1].set_ylabel('PCA 2')
+plt.colorbar(scatter2, ax=axes[0,1])
+
+# DBSCAN PCA
+scatter3 = axes[0,2].scatter(df['pca_1'], df['pca_2'], c=df['cluster_dbscan'],
+                              cmap='tab10', alpha=0.6, s=30)
+axes[0,2].set_title('DBSCAN (PCA)')
+axes[0,2].set_xlabel('PCA 1')
+axes[0,2].set_ylabel('PCA 2')
+plt.colorbar(scatter3, ax=axes[0,2])
+
+# K-Means t-SNE
+scatter4 = axes[1,0].scatter(df['tsne_1'], df['tsne_2'], c=df['cluster_kmeans'],
+                              cmap='viridis', alpha=0.6, s=30)
+axes[1,0].set_title(f'K-Means (t-SNE, {optimal_k} кластеров)')
+axes[1,0].set_xlabel('t-SNE 1')
+axes[1,0].set_ylabel('t-SNE 2')
+plt.colorbar(scatter4, ax=axes[1,0])
+
+# Agglomerative t-SNE
+scatter5 = axes[1,1].scatter(df['tsne_1'], df['tsne_2'], c=df['cluster_agglo'],
+                              cmap='plasma', alpha=0.6, s=30)
+axes[1,1].set_title(f'Agglomerative (t-SNE, {optimal_k} кластеров)')
+axes[1,1].set_xlabel('t-SNE 1')
+axes[1,1].set_ylabel('t-SNE 2')
+plt.colorbar(scatter5, ax=axes[1,1])
+
+# DBSCAN t-SNE
+scatter6 = axes[1,2].scatter(df['tsne_1'], df['tsne_2'], c=df['cluster_dbscan'],
+                              cmap='tab10', alpha=0.6, s=30)
+axes[1,2].set_title('DBSCAN (t-SNE)')
+axes[1,2].set_xlabel('t-SNE 1')
+axes[1,2].set_ylabel('t-SNE 2')
+plt.colorbar(scatter6, ax=axes[1,2])
+
+plt.tight_layout()
+plt.show()
+
+
+
+# 7. Профилирование кластеров
+
+# Выбираем лучший алгоритм (K-Means)
+best_cluster = 'cluster_kmeans'
+df['cluster'] = df[best_cluster]
+
+# Анализ кластеров
+cluster_stats = df.groupby('cluster').agg({
+    'annual_revenue': ['mean', 'median', 'std'],
+    'business_age_years': ['mean', 'median'],
+    'employees': ['mean', 'median'],
+    'profit_margin': ['mean', 'median'],
+    'credit_score': ['mean', 'median'],
+    'existing_loans': ['mean'],
+    'default_history': ['mean'],
+    'requested_loan': ['mean', 'median'],
+    'transaction_frequency': ['mean'],
+    'customer_lifetime_months': ['mean']
+}).round(2)
+
+print("Статистика по кластерам:")
+print(cluster_stats)
+
+# Категориальные переменные по кластерам
+cluster_business = pd.crosstab(df['cluster'], df['business_type'], normalize='index')
+cluster_region = pd.crosstab(df['cluster'], df['region'], normalize='index')
+
+print("\nРаспределение типов бизнеса по кластерам (%):")
+print(cluster_business.round(2))
+
+print("\nРаспределение регионов по кластерам (%):")
+print(cluster_region.round(2))
+
+# Профили кластеров
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig.suptitle('Профили кластеров клиентов', fontsize=16)
+
+# Выручка
+df.boxplot(column='annual_revenue', by='cluster', ax=axes[0,0])
+axes[0,0].set_title('Годовая выручка по кластерам')
+axes[0,0].set_xlabel('Кластер')
+axes[0,0].set_ylabel('Выручка (руб)')
+
+# Возраст бизнеса
+df.boxplot(column='business_age_years', by='cluster', ax=axes[0,1])
+axes[0,1].set_title('Возраст бизнеса по кластерам')
+axes[0,1].set_xlabel('Кластер')
+axes[0,1].set_ylabel('Возраст (лет)')
+
+# Кредитный скоринг
+df.boxplot(column='credit_score', by='cluster', ax=axes[0,2])
+axes[0,2].set_title('Кредитный скоринг по кластерам')
+axes[0,2].set_xlabel('Кластер')
+axes[0,2].set_ylabel('Credit Score')
+
+# Доля дефолтов
+df.groupby('cluster')['default_history'].mean().plot(kind='bar', ax=axes[1,0])
+axes[1,0].set_title('Доля дефолтов по кластерам')
+axes[1,0].set_xlabel('Кластер')
+axes[1,0].set_ylabel('Доля дефолтов')
+
+# Запрашиваемая сумма
+df.boxplot(column='requested_loan', by='cluster', ax=axes[1,1])
+axes[1,1].set_title('Запрашиваемая сумма кредита по кластерам')
+axes[1,1].set_xlabel('Кластер')
+axes[1,1].set_ylabel('Сумма (руб)')
+
+# Активность транзакций
+df.groupby('cluster')['transaction_frequency'].mean().plot(kind='bar', ax=axes[1,2])
+axes[1,2].set_title('Частота транзакций по кластерам')
+axes[1,2].set_xlabel('Кластер')
+axes[1,2].set_ylabel('Средняя частота')
+
+plt.tight_layout()
+plt.show()
+
+"""## 8. Интерпретация кластеров для бизнеса"""
+
+# Создаем интерпретацию
+cluster_profiles = {}
+
+for cluster_id in sorted(df['cluster'].unique()):
+    cluster_data = df[df['cluster'] == cluster_id]
+
+    # Основные характеристики
+    avg_revenue = cluster_data['annual_revenue'].mean()
+    avg_age = cluster_data['business_age_years'].mean()
+    avg_credit = cluster_data['credit_score'].mean()
+    default_rate = cluster_data['default_history'].mean()
+    avg_loan = cluster_data['requested_loan'].mean()
+    n_clients = len(cluster_data)
+
+    # Определяем тип кластера
+    if avg_revenue > 50000000 and avg_credit > 700 and default_rate < 0.05:
+        cluster_type = 'Премьер-клиенты (низкий риск)'
+        strategy = 'Одобрять кредиты до 15 млн руб., сниженная ставка, индивидуальные условия'
+    elif avg_age < 3 and default_rate > 0.2:
+        cluster_type = 'Стартапы (высокий риск)'
+        strategy = 'Повышенные требования к залогу, ставка выше среднего, тщательный скоринг'
+    elif avg_loan > 5000000 and avg_revenue > 20000000:
+        cluster_type = 'Крупные заемщики'
+        strategy = 'Специальные кредитные программы, гибкие условия, персональный менеджер'
+    elif avg_age > 10 and default_rate < 0.05:
+        cluster_type = 'Стабильный бизнес'
+        strategy = 'Стандартные условия, возможны повторные кредиты, лояльные условия'
+    elif default_rate > 0.3:
+        cluster_type = 'Проблемные клиенты'
+        strategy = 'Повышенный контроль, требования к обеспечению, ограничение сумм'
+    else:
+        cluster_type = 'Средний бизнес'
+        strategy = 'Стандартный скоринг, конкурентные ставки'
+
+    cluster_profiles[cluster_id] = {
+        'type': cluster_type,
+        'count': n_clients,
+        'avg_revenue': avg_revenue,
+        'avg_age': avg_age,
+        'avg_credit': avg_credit,
+        'default_rate': default_rate,
+        'avg_loan': avg_loan,
+        'strategy': strategy
+    }
+
+print("=" * 80)
+print("ПРОФИЛИ КЛАСТЕРОВ КЛИЕНТОВ ДЛЯ КРЕДИТНОЙ ПОЛИТИКИ")
+print("=" * 80)
+
+for cluster_id, profile in cluster_profiles.items():
+    print(f"\nКластер {cluster_id}: {profile['type']}")
+    print(f"Количество клиентов: {profile['count']}")
+    print(f"Средняя выручка: {profile['avg_revenue']:,.0f} руб.")
+    print(f"Средний возраст бизнеса: {profile['avg_age']:.1f} лет")
+    print(f"Средний кредитный скоринг: {profile['avg_credit']:.0f}")
+    print(f"Доля дефолтов: {profile['default_rate']:.1%}")
+    print(f"Средняя запрашиваемая сумма: {profile['avg_loan']:,.0f} руб.")
+    print(f"Рекомендуемая стратегия: {profile['strategy']}")
+
+
+
+# 9. Дендрограмма для иерархической кластеризации
+
+# Выборка для дендрограммы (уменьшаем для читаемости)
+sample_size = 150
+sample_idx = np.random.choice(len(X_scaled_df), sample_size, replace=False)
+X_sample = X_scaled_df.iloc[sample_idx]  # Используем iloc вместо прямого индекса
+
+# Построение дендрограммы
+from scipy.cluster.hierarchy import dendrogram, linkage
+
+linked = linkage(X_sample, method='ward')
+
+fig, ax = plt.subplots(figsize=(14, 7))
+dendrogram(linked,
+           orientation='top',
+           distance_sort='descending',
+           show_leaf_counts=False,
+           ax=ax,
+           truncate_mode='level',
+           p=5)
+
+ax.axhline(y=15, color='red', linestyle='--', alpha=0.7, label='Порог отсечения')
+ax.set_title('Дендрограмма клиентов (иерархическая кластеризация)')
+ax.set_xlabel('Номер клиента')
+ax.set_ylabel('Евклидово расстояние')
+ax.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+"""## 10. Рекомендации для кредитного департамента"""
+
+recommendations = {
+    'Сегментация клиентов':
+        'Разделите клиентов на 5 кластеров с разными кредитными продуктами и условиями',
+
+    'Скоринговая модель':
+        'Используйте кластерные профили как дополнительные признаки в модели скоринга',
+
+    'Индивидуальные ставки':
+        'Для кластера 0 (Премьер) - ставка 8-10%, для кластера 2 (Стартапы) - 18-22%',
+
+    'Автоматизация решений':
+        'Внедрите правила: кластер 0 и 3 - автоматическое одобрение до 5 млн руб.',
+
+    'Мониторинг рисков':
+        'Фокус на кластер 4 (Проблемные) - усиленный контроль и работа с задолженностью',
+
+    'Кросс-продажи':
+        'Кластер 1 (Крупные) - предлагайте дополнительные услуги (лизинг, факторинг)',
+
+    'Удержание клиентов':
+        'Кластер 3 (Стабильные) - программы лояльности и рефинансирования',
+
+    'Улучшение качества данных':
+        'Собирайте больше данных для кластера 2 (Стартапы) для точной оценки'
+}
+
+print("=" * 80)
+print("РЕКОМЕНДАЦИИ ДЛЯ КРЕДИТНОГО ДЕПАРТАМЕНТА НА ОСНОВЕ КЛАСТЕРИЗАЦИИ")
+print("=" * 80)
+
+for key, value in recommendations.items():
+    print(f"\n{key}:")
+    print(f"  {value}")
+
+"""## 11. Визуализация бизнес-метрик кластеризации"""
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle('Бизнес-метрики кластеризации', fontsize=16)
+
+# Распределение клиентов по кластерам
+cluster_counts = df['cluster'].value_counts().sort_index()
+axes[0,0].bar(cluster_counts.index, cluster_counts.values, color='skyblue', edgecolor='black')
+axes[0,0].set_title('Распределение клиентов по кластерам')
+axes[0,0].set_xlabel('Кластер')
+axes[0,0].set_ylabel('Количество клиентов')
+for i, v in enumerate(cluster_counts.values):
+    axes[0,0].text(i, v + 10, str(v), ha='center')
+axes[0,0].grid(True, alpha=0.3)
+
+# Средняя запрашиваемая сумма
+avg_loan_by_cluster = df.groupby('cluster')['requested_loan'].mean()
+axes[0,1].bar(avg_loan_by_cluster.index, avg_loan_by_cluster.values,
+              color='lightgreen', edgecolor='black')
+axes[0,1].set_title('Средняя запрашиваемая сумма кредита')
+axes[0,1].set_xlabel('Кластер')
+axes[0,1].set_ylabel('Сумма (руб)')
+axes[0,1].grid(True, alpha=0.3)
+
+# Доля дефолтов с доверительными интервалами
+def rate_std(data):
+    return np.std(data) / np.sqrt(len(data))
+
+default_by_cluster = df.groupby('cluster')['default_history'].agg(['mean', lambda x: rate_std(x)])
+default_by_cluster.columns = ['mean', 'std']
+
+axes[1,0].bar(default_by_cluster.index, default_by_cluster['mean'],
+              yerr=default_by_cluster['std'], capsize=5,
+              color='salmon', edgecolor='black')
+axes[1,0].set_title('Доля дефолтов по кластерам')
+axes[1,0].set_xlabel('Кластер')
+axes[1,0].set_ylabel('Доля дефолтов')
+axes[1,0].set_ylim(0, 0.5)
+axes[1,0].grid(True, alpha=0.3)
+
+# Потенциальная прибыльность (выручка - риск)
+df['profit_potential'] = df['annual_revenue'] * (1 - df['default_history'] * 0.3)
+profit_by_cluster = df.groupby('cluster')['profit_potential'].mean()
+
+axes[1,1].bar(profit_by_cluster.index, profit_by_cluster.values,
+              color='purple', edgecolor='black', alpha=0.7)
+axes[1,1].set_title('Потенциальная прибыльность по кластерам')
+axes[1,1].set_xlabel('Кластер')
+axes[1,1].set_ylabel('Средняя прибыльность (руб)')
+axes[1,1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+
+# 12. Сохранение результатов
+
+# Создаем список столбцов для сохранения
+columns_to_save = ['client_id', 'business_type', 'region', 'cluster']
+
+# Добавляем все признаки, которые есть в df
+for col in features_for_clustering:
+    if col in df.columns:
+        columns_to_save.append(col)
+
+# Сохраняем только существующие столбцы
+df[columns_to_save].to_csv('clients_with_clusters.csv', index=False)
+
+print("Датасет с кластерами сохранен: clients_with_clusters.csv")
+print(f"Всего клиентов: {len(df)}")
+print(f"Количество кластеров: {optimal_k}")
+
+print("\nФинальная статистика по кластерам:")
+cluster_summary = df.groupby('cluster').agg({
+    'client_id': 'count',
+    'annual_revenue': 'mean',
+    'credit_score': 'mean',
+    'default_history': 'mean',
+    'requested_loan': 'mean'
+}).round(2)
+
+cluster_summary.columns = ['count', 'avg_revenue', 'avg_credit_score', 'default_rate', 'avg_loan']
+print(cluster_summary)
+
+print("\n" + "=" * 80)
+print("КЛАСТЕРИЗАЦИЯ КЛИЕНТОВ МСБ УСПЕШНО ЗАВЕРШЕНА")
+print("=" * 80)
+print(f"Оптимальное число кластеров: {optimal_k}")
+print(f"Silhouette Score: {silhouette_scores[optimal_k-2]:.3f}")
+print("Выявлены сегменты клиентов с разными кредитными профилями")
+print("Разработаны стратегии для каждого кластера")
+print("=" * 80)
+
+## 13. Интерпретируемость вклада признаков в кластеризацию
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+
+# Создаем список признаков, которые есть в df
+available_features = []
+for col in features_for_clustering:
+    if col in df.columns:
+        available_features.append(col)
+
+# Добавляем логарифмические признаки в df, если их нет
+log_cols = ['annual_revenue_log', 'total_debt_log', 'requested_loan_log', 'average_check_log']
+for col in log_cols:
+    if col not in df.columns:
+        if 'annual_revenue' in col:
+            df['annual_revenue_log'] = np.log1p(df['annual_revenue'])
+        elif 'total_debt' in col:
+            df['total_debt_log'] = np.log1p(df['total_debt'])
+        elif 'requested_loan' in col:
+            df['requested_loan_log'] = np.log1p(df['requested_loan'])
+        elif 'average_check' in col:
+            df['average_check_log'] = np.log1p(df['average_check'])
+
+# Добавляем логарифмические признаки в список доступных
+for col in log_cols:
+    if col in df.columns:
+        available_features.append(col)
+
+# Подготавливаем данные для анализа важности признаков
+X_features = df[available_features].copy()
+y_clusters = df['cluster']
+
+# Обучаем случайный лес для определения важности признаков
+rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+rf.fit(X_features, y_clusters)
+
+# Получаем важность признаков
+feature_importance = pd.DataFrame({
+    'feature': available_features,
+    'importance': rf.feature_importances_
+}).sort_values('importance', ascending=False)
+
+# Вычисляем permutation importance для проверки
+perm_importance = permutation_importance(rf, X_features, y_clusters,
+                                         n_repeats=10, random_state=42, n_jobs=-1)
+feature_importance['permutation_importance'] = perm_importance.importances_mean
+
+# Визуализация важности признаков
+fig, axes = plt.subplots(1, 2, figsize=(16, 10))
+
+# Горизонтальная диаграмма важности
+top_features = feature_importance.head(15)
+colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(top_features)))[::-1]
+
+axes[0].barh(top_features['feature'], top_features['importance'], color=colors)
+axes[0].set_xlabel('Важность признака', fontsize=12)
+axes[0].set_title('Топ-15 признаков, определяющих кластеры клиентов\n(на основе Random Forest)', fontsize=14)
+axes[0].grid(True, alpha=0.3, axis='x')
+axes[0].set_xlim(0, max(top_features['importance']) * 1.1)
+
+# Добавляем значения на столбцы
+for i, v in enumerate(top_features['importance']):
+    axes[0].text(v + 0.002, i, f'{v:.3f}', va='center', fontsize=10)
+
+# Второй график: сравнение двух методов важности
+feature_importance_sorted = feature_importance.sort_values('importance', ascending=False).head(10)
+x = np.arange(len(feature_importance_sorted))
+width = 0.35
+
+axes[1].bar(x - width/2, feature_importance_sorted['importance'], width,
+            label='Gini Importance', color='steelblue', alpha=0.8)
+axes[1].bar(x + width/2, feature_importance_sorted['permutation_importance'], width,
+            label='Permutation Importance', color='coral', alpha=0.8)
+
+axes[1].set_xlabel('Признаки', fontsize=12)
+axes[1].set_ylabel('Важность', fontsize=12)
+axes[1].set_title('Сравнение методов оценки важности признаков', fontsize=14)
+axes[1].set_xticks(x)
+axes[1].set_xticklabels(feature_importance_sorted['feature'], rotation=45, ha='right')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.show()
+
+# Детальная таблица важности
+print("=" * 80)
+print("ИНТЕРПРЕТАЦИЯ ВКЛАДА ПРИЗНАКОВ В КЛАСТЕРИЗАЦИЮ")
+print("=" * 80)
+print("\nТоп-10 наиболее важных признаков для разделения клиентов на кластеры:")
+print("-" * 80)
+
+for idx, row in feature_importance.head(10).iterrows():
+    feature = row['feature']
+    importance = row['importance']
+    perm_importance = row['permutation_importance']
+
+    # Интерпретация
+    if feature in ['annual_revenue', 'annual_revenue_log']:
+        interpretation = 'Размер бизнеса - ключевой фактор сегментации'
+    elif feature in ['credit_score']:
+        interpretation = 'Кредитоспособность определяет риск-профиль клиента'
+    elif feature in ['default_history']:
+        interpretation = 'Прошлые дефолты - сильный предиктор поведения'
+    elif feature in ['requested_loan', 'requested_loan_log']:
+        interpretation = 'Потребность в финансировании формирует кластер'
+    elif feature in ['business_age_years']:
+        interpretation = 'Зрелость бизнеса влияет на стабильность'
+    elif feature in ['employees']:
+        interpretation = 'Размер компании как прокси масштаба'
+    elif feature in ['profit_margin']:
+        interpretation = 'Эффективность бизнеса и его устойчивость'
+    elif feature in ['total_debt', 'total_debt_log']:
+        interpretation = 'Долговая нагрузка - показатель риска'
+    elif feature in ['transaction_frequency', 'transaction_activity']:
+        interpretation = 'Активность бизнеса отражает его жизнеспособность'
+    elif feature in ['existing_loans']:
+        interpretation = 'Кредитная история в банке'
+    elif feature in ['average_check', 'average_check_log']:
+        interpretation = 'Средний чек как показатель масштаба операций'
+    elif feature in ['customer_lifetime_months']:
+        interpretation = 'Лояльность и длительность отношений с банком'
+    elif feature in ['debt_to_revenue', 'loan_to_revenue']:
+        interpretation = 'Финансовые коэффициенты долговой устойчивости'
+    elif 'encoded' in feature:
+        interpretation = 'Категориальный признак (тип бизнеса или регион)'
+    else:
+        interpretation = 'Вспомогательный финансовый показатель'
+
+    print(f"{idx+1:2d}. {feature:30s} | Важность: {importance:.4f} | {interpretation}")
+
+print("\n" + "=" * 80)
+print("ИНТЕРПРЕТАЦИЯ КЛАСТЕРОВ НА ОСНОВЕ ВАЖНЫХ ПРИЗНАКОВ")
+print("=" * 80)
+
+# Анализ средних значений по кластерам для топ-5 признаков
+top5_features = feature_importance.head(5)['feature'].tolist()
+
+fig, axes = plt.subplots(1, 5, figsize=(20, 6))
+fig.suptitle('Распределение ключевых признаков по кластерам', fontsize=16)
+
+for idx, feature in enumerate(top5_features):
+    # Нормализуем данные для сравнения
+    feature_data = df.groupby('cluster')[feature].mean().sort_index()
+
+    axes[idx].bar(feature_data.index, feature_data.values,
+                  color=plt.cm.Set3(np.linspace(0, 1, len(feature_data))))
+    axes[idx].set_title(f'{feature}', fontsize=12)
+    axes[idx].set_xlabel('Кластер')
+    axes[idx].set_ylabel('Среднее значение')
+    axes[idx].grid(True, alpha=0.3, axis='y')
+
+    # Добавляем значения
+    for i, v in enumerate(feature_data.values):
+        axes[idx].text(i, v + v*0.02, f'{v:.1f}', ha='center', fontsize=9)
+
+plt.tight_layout()
+plt.show()
+
+# Сводная таблица профилей кластеров по ключевым признакам
+print("\nСВОДНЫЙ ПРОФИЛЬ КЛАСТЕРОВ ПО КЛЮЧЕВЫМ ПРИЗНАКАМ:")
+print("-" * 80)
+
+# Выбираем топ-10 признаков для профиля
+top10_features = feature_importance.head(10)['feature'].tolist()
+
+# Создаем сводную таблицу
+profile_table = df.groupby('cluster')[top10_features].mean().round(2)
+
+# Добавляем размер кластера и долю дефолтов
+profile_table['cluster_size'] = df.groupby('cluster').size()
+profile_table['default_rate'] = df.groupby('cluster')['default_history'].mean().round(3)
+
+print(profile_table)
+
+# Интерпретация кластеров на основе важных признаков
+print("\n" + "=" * 80)
+print("ИНТЕРПРЕТАЦИЯ КАЖДОГО КЛАСТЕРА НА ОСНОВЕ КЛЮЧЕВЫХ ПРИЗНАКОВ")
+print("=" * 80)
+
+for cluster_id in sorted(df['cluster'].unique()):
+    cluster_data = df[df['cluster'] == cluster_id]
+    profile = cluster_profiles[cluster_id]
+
+    print(f"\nКластер {cluster_id}: {profile['type']}")
+    print(f"Размер: {profile['count']} клиентов ({profile['count']/len(df)*100:.1f}%)")
+
+    # Определяем ключевые характеристики
+    print("\nКлючевые характеристики:")
+
+    # Анализируем топ-5 признаков
+    for feature in top5_features:
+        mean_val = cluster_data[feature].mean()
+        global_mean = df[feature].mean()
+
+        if mean_val > global_mean * 1.3:
+            direction = 'ВЫШЕ среднего'
+            symbol = '↑'
+        elif mean_val < global_mean * 0.7:
+            direction = 'НИЖЕ среднего'
+            symbol = '↓'
+        else:
+            direction = 'на уровне среднего'
+            symbol = '→'
+
+        print(f"  {symbol} {feature}: {mean_val:.2f} ({direction})")
+
+    print(f"\nРекомендуемая стратегия: {profile['strategy']}")
+    print("-" * 50)
+
+# Визуализация важности через SHAP-подобный анализ (упрощенный)
+fig, ax = plt.subplots(figsize=(12, 8))
+
+# Используем стандартизированные коэффициенты для интерпретации
+feature_importance_plot = feature_importance.head(15).copy()
+feature_importance_plot['color'] = ['#2E86AB' if i < 5 else '#A23B72' if i < 10 else '#F18F01'
+                                    for i in range(len(feature_importance_plot))]
+
+bars = ax.barh(feature_importance_plot['feature'], feature_importance_plot['importance'],
+               color=feature_importance_plot['color'], edgecolor='black', linewidth=0.5)
+
+ax.set_xlabel('Вклад в разделение кластеров (важность)', fontsize=13)
+ax.set_title('Интерпретируемость: какие признаки определяют сегменты клиентов?', fontsize=15)
+ax.grid(True, alpha=0.3, axis='x')
+
+# Добавляем легенду
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor='#2E86AB', label='Ключевые признаки (топ-5)'),
+    Patch(facecolor='#A23B72', label='Важные признаки (6-10)'),
+    Patch(facecolor='#F18F01', label='Дополнительные признаки (11-15)')
+]
+ax.legend(handles=legend_elements, loc='lower right')
+
+# Добавляем значения
+for i, (idx, row) in enumerate(feature_importance_plot.iterrows()):
+    ax.text(row['importance'] + 0.002, i, f'{row["importance"]:.3f}',
+            va='center', fontsize=10)
+
+plt.tight_layout()
+plt.show()
+
+# Финальный отчет по интерпретируемости
+print("\n" + "=" * 80)
+print("ВЫВОДЫ ПО ИНТЕРПРЕТИРУЕМОСТИ КЛАСТЕРИЗАЦИИ")
+print("=" * 80)
+
+print("\n1. Основные факторы сегментации клиентов:")
+print("   - Финансовый размер (выручка, запрашиваемая сумма)")
+print("   - Кредитоспособность (кредитный скоринг, история дефолтов)")
+print("   - Зрелость бизнеса (возраст компании)")
+
+print("\n2. Второстепенные, но значимые факторы:")
+print("   - Эффективность (рентабельность, выручка на сотрудника)")
+print("   - Долговая нагрузка (соотношение долга к выручке)")
+print("   - Активность (частота транзакций, лояльность)")
+
+print("\n3. Практические рекомендации по использованию:")
+print("   - Используйте топ-5 признаков для быстрой сегментации")
+print("   - Добавьте топ-10 признаков для точной настройки условий")
+print("   - Учитывайте все признаки для комплексной оценки рисков")
+
+print("\n4. Бизнес-ценность интерпретации:")
+print("   - Прозрачность принятия решений по кредитам")
+print("   - Обоснование дифференцированных условий")
+print("   - Выявление скрытых паттернов поведения клиентов")
+print("   - Улучшение модели скоринга на основе кластеров")
+
+print("=" * 80)
