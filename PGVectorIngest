@@ -1,0 +1,306 @@
+from langchain_community.vectorstores import PGVector
+from langchain.schema import Document
+from lfx.base.vectorstores.model import LCVectorStoreComponent, check_cached_vector_store
+from lfx.helpers.data import docs_to_data
+from lfx.io import HandleInput, SecretStrInput, StrInput, BoolInput
+from lfx.schema.data import Data
+from lfx.utils.connection_string_parser import transform_connection_string
+import time
+from datetime import datetime
+import pandas as pd
+
+class PGVectorIngestComponent(LCVectorStoreComponent):
+    display_name = "PGVector Ingest"
+    description = "Загрузка документов в PGVector"
+    name = "pgvector_ingest"
+    icon = "upload"
+    
+    inputs = [
+        SecretStrInput(
+            name="pg_server_url", 
+            display_name="PostgreSQL Server Connection String", 
+            required=True
+        ),
+        StrInput(
+            name="collection_name", 
+            display_name="Table (Collection Name)", 
+            required=True,
+            value="bank_embeddings"
+        ),
+        HandleInput(
+            name="documents", 
+            display_name="Documents for Ingest", 
+            input_types=["Data", "Document", "Message", "Text", "List", "Table"],
+            required=True
+        ),
+        HandleInput(
+            name="embedding", 
+            display_name="Embedding Model", 
+            input_types=["Embeddings"], 
+            required=True
+        ),
+        StrInput(
+            name="text_column",
+            display_name="Text Column Name",
+            value="text",
+            info="Имя колонки в таблице, которая содержит текст для векторизации"
+        ),
+        BoolInput(
+            name="combine_chunks",
+            display_name="Combine Chunks into One Document",
+            value=False,
+            info="Если True - все чанки объединяются в один документ"
+        ),
+    ]
+    
+    # Флаг для предотвращения повторного выполнения
+    _is_ingesting = False
+    
+    def _log_debug(self, message, data=None):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}]  INGEST: {message}", flush=True)
+        if data is not None:
+            if isinstance(data, (list, dict)):
+                print(f"[{timestamp}]  DATA: {str(data)[:500]}", flush=True)
+            else:
+                print(f"[{timestamp}]  DATA: {data}", flush=True)
+    
+    def _convert_table_to_documents(self, table_data):
+        """Конвертация Table в документы"""
+        self._log_debug(" ОБРАБОТКА TABLE (от Split Text)")
+        
+        documents = []
+        
+        # Если это pandas DataFrame
+        if isinstance(table_data, pd.DataFrame):
+            self._log_debug(f"Это pandas DataFrame. Shape: {table_data.shape}")
+            self._log_debug(f"Колонки: {list(table_data.columns)}")
+            
+            # Проверяем наличие колонки с текстом
+            text_col = self.text_column
+            if text_col not in table_data.columns:
+                self._log_debug(f" Колонка '{text_col}' не найдена!")
+                # Пробуем найти колонку с текстом
+                for col in table_data.columns:
+                    if 'text' in col.lower() or 'content' in col.lower():
+                        text_col = col
+                        self._log_debug(f" Использую колонку '{col}'")
+                        break
+                else:
+                    for col in table_data.columns:
+                        if table_data[col].dtype == 'object':
+                            text_col = col
+                            self._log_debug(f" Использую первую строковую колонку '{col}'")
+                            break
+            
+            # Если нужно объединить все чанки
+            if self.combine_chunks:
+                self._log_debug(" Режим: ОБЪЕДИНЕНИЕ ВСЕХ ЧАНКОВ")
+                combined_text = ""
+                for idx, row in table_data.iterrows():
+                    text = str(row.get(text_col, ""))
+                    if text and text.strip():
+                        combined_text += text + "\n"
+                
+                if combined_text.strip():
+                    doc = Document(
+                        page_content=combined_text.strip(),
+                        metadata={
+                            "source": "split_text",
+                            "chunks_count": len(table_data)
+                        }
+                    )
+                    documents.append(doc)
+                    self._log_debug(f"Объединено {len(table_data)} чанков в 1 документ")
+                return documents
+            
+            # Каждый чанк как отдельный документ
+            self._log_debug(" Режим: КАЖДЫЙ ЧАНК КАК ОТДЕЛЬНЫЙ ДОКУМЕНТ")
+            for idx, row in table_data.iterrows():
+                text = str(row.get(text_col, ""))
+                if text and text.strip():
+                    metadata = {"chunk_index": idx, "total_chunks": len(table_data)}
+                    for col in table_data.columns:
+                        if col != text_col and pd.notna(row.get(col)):
+                            metadata[col] = str(row.get(col))
+                    
+                    doc = Document(page_content=text.strip(), metadata=metadata)
+                    documents.append(doc)
+            
+            self._log_debug(f" Создано {len(documents)} документов из таблицы")
+            return documents
+        
+        # Если это список словарей
+        if isinstance(table_data, list) and all(isinstance(item, dict) for item in table_data):
+            self._log_debug(f"Это список из {len(table_data)} словарей")
+            if table_data:
+                self._log_debug(f"Ключи первого элемента: {list(table_data[0].keys())}")
+            df = pd.DataFrame(table_data)
+            return self._convert_table_to_documents(df)
+        
+        # Если это словарь
+        if isinstance(table_data, dict):
+            self._log_debug("Это словарь (одна строка таблицы)")
+            text = str(table_data.get(self.text_column, ""))
+            if text.strip():
+                metadata = {k: str(v) for k, v in table_data.items() if k != self.text_column}
+                doc = Document(page_content=text.strip(), metadata=metadata)
+                documents.append(doc)
+            return documents
+        
+        return documents
+    
+    def _convert_to_documents(self, input_data):
+        """Универсальный конвертер"""
+        documents = []
+        
+        # Проверка на Table
+        if hasattr(input_data, '__class__') and 'Table' in str(input_data.__class__):
+            return self._convert_table_to_documents(input_data)
+        
+        if isinstance(input_data, pd.DataFrame):
+            return self._convert_table_to_documents(input_data)
+        
+        # Список
+        if isinstance(input_data, list):
+            self._log_debug(f" ОБНАРУЖЕН СПИСОК ИЗ {len(input_data)} ЭЛЕМЕНТОВ")
+            if input_data and all(isinstance(item, dict) for item in input_data):
+                return self._convert_table_to_documents(input_data)
+            
+            for idx, item in enumerate(input_data):
+                docs = self._convert_to_documents(item)
+                documents.extend(docs)
+            return documents
+        
+        # Data (LangFlow)
+        if isinstance(input_data, Data):
+            self._log_debug(" Конвертация Data → Document")
+            try:
+                doc = input_data.to_lc_document()
+                if hasattr(doc, 'page_content') and doc.page_content:
+                    documents.append(doc)
+            except Exception as e:
+                self._log_debug(f" Ошибка конвертации Data: {e}")
+            return documents
+        
+        # Document (LangChain)
+        if isinstance(input_data, Document):
+            if input_data.page_content:
+                documents.append(input_data)
+            return documents
+        
+        # Строка
+        if isinstance(input_data, str):
+            if input_data.strip():
+                doc = Document(page_content=input_data)
+                documents.append(doc)
+            return documents
+        
+        # Словарь
+        if isinstance(input_data, dict):
+            for key in ['text', 'content', 'page_content']:
+                if key in input_data and input_data[key]:
+                    text = str(input_data[key])
+                    if text.strip():
+                        metadata = {k: str(v) for k, v in input_data.items() if k != key}
+                        doc = Document(page_content=text.strip(), metadata=metadata)
+                        documents.append(doc)
+                        return documents
+            return documents
+        
+        # Fallback
+        str_data = str(input_data)
+        if str_data.strip():
+            doc = Document(page_content=str_data)
+            documents.append(doc)
+        
+        return documents
+    
+    @check_cached_vector_store
+    def build_vector_store(self) -> PGVector:
+        """Метод загрузки - вызывается LangFlow"""
+        self._log_debug("=" * 80)
+        self._log_debug("🚀 НАЧАЛО ЗАГРУЗКИ ДАННЫХ В PGVector")
+        self._log_debug("=" * 80)
+        
+        # Проверка эмбеддинга
+        if not self.embedding:
+            self._log_debug("❌ ОШИБКА: Эмбеддинг модель не задана!")
+            raise ValueError("Embedding model is required")
+        
+        try:
+            test_embedding = self.embedding.embed_query("Тест")
+            self._log_debug(f" Эмбеддинг работает. Размерность: {len(test_embedding)}")
+        except Exception as e:
+            self._log_debug(f" ОШИБКА эмбеддинга: {e}")
+            raise
+        
+        # Получение документов
+        self._log_debug(f"Тип documents: {type(self.documents)}")
+        
+        if self.documents is None:
+            self._log_debug(" ОШИБКА: documents = None!")
+            raise ValueError("No documents provided")
+        
+        # Конвертация
+        self._log_debug("Конвертация в документы LangChain...")
+        lc_documents = self._convert_to_documents(self.documents)
+        
+        if not lc_documents:
+            self._log_debug(" ОШИБКА: Нет документов для загрузки!")
+            raise ValueError("No valid documents to ingest")
+        
+        self._log_debug(f" Подготовлено {len(lc_documents)} документов для загрузки")
+        
+        # Показываем примеры
+        for i, doc in enumerate(lc_documents[:3]):
+            self._log_debug(f"  Документ {i+1}: {doc.page_content[:100]}...")
+        
+        # Подключение к БД
+        connection_string = transform_connection_string(self.pg_server_url)
+        self._log_debug(f"Строка подключения: {connection_string}")
+        self._log_debug(f"Имя коллекции: {self.collection_name}")
+        
+        # Загрузка
+        try:
+            start_time = time.time()
+            
+            self._log_debug(f"Вызываю PGVector.from_documents с {len(lc_documents)} документами...")
+            
+            pgvector = PGVector.from_documents(
+                embedding=self.embedding,
+                documents=lc_documents,
+                collection_name=self.collection_name,
+                connection_string=connection_string,
+            )
+            
+            elapsed = time.time() - start_time
+            self._log_debug(f" ЗАГРУЗКА УСПЕШНО ЗАВЕРШЕНА за {elapsed:.2f} секунд!")
+            self._log_debug(f" Загружено {len(lc_documents)} документов")
+            
+            self._log_debug("=" * 80)
+            self._log_debug(" РАБОТА ЗАВЕРШЕНА УСПЕШНО")
+            self._log_debug("=" * 80)
+            
+            return pgvector
+            
+        except Exception as e:
+            self._log_debug(f" КРИТИЧЕСКАЯ ОШИБКА при загрузке: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def search_documents(self) -> list[Data]:
+        """ВАЖНО: Этот метод вызывается при выполнении компонента в LangFlow"""
+        self._log_debug("=" * 80)
+        self._log_debug(" ВЫЗВАН search_documents() - выполняем загрузку...")
+        self._log_debug("=" * 80)
+        
+        # Вызываем build_vector_store для загрузки
+        try:
+            pgvector = self.build_vector_store()
+            self._log_debug(" Данные успешно загружены!")
+            return []  # Возвращаем пустой список, так как это загрузка
+        except Exception as e:
+            self._log_debug(f" Ошибка загрузки: {e}")
+            return []
