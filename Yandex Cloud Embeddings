@@ -1,0 +1,162 @@
+from lfx.base.embeddings.model import LCEmbeddingsModel
+from lfx.field_typing import Embeddings
+from lfx.io import (
+    SecretStrInput,
+    StrInput,
+    IntInput,
+    FloatInput,
+)
+from langchain_core.embeddings import Embeddings
+from typing import List
+import requests
+import json
+import time
+
+
+class YandexCloudEmbeddings(Embeddings):
+    def __init__(
+        self,
+        api_key: str,
+        folder_id: str,
+        model: str,
+        base_url: str,
+        dimensions: int = None,
+        delay: float = 0.2
+    ):
+        self.api_key = api_key
+        self.folder_id = folder_id
+        self.model = model
+        self.base_url = base_url
+        self.dimensions = dimensions
+        self.delay = delay
+        
+        if self.base_url.endswith('/'):
+            self.base_url = self.base_url[:-1]
+        self.endpoint = self.base_url
+        
+    def embed_query(self, text: str) -> List[float]:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "x-folder-id": self.folder_id,
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "modelUri": self.model,
+            "text": text
+        }
+        
+        if self.dimensions:
+            payload["dimensions"] = self.dimensions
+        
+        print(f"   Sending to Yandex: {self.endpoint}")
+        print(f"   Headers: x-folder-id={self.folder_id}")
+        print(f"   Payload: {json.dumps(payload, ensure_ascii=False)}")
+        
+        try:
+            response = requests.post(
+                self.endpoint,
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+            
+            print(f"   Response status: {response.status_code}")
+            
+            if response.status_code == 429:
+                print(f"   Rate limit hit, waiting 1 second...")
+                time.sleep(1)
+                return self.embed_query(text)
+            
+            if response.status_code != 200:
+                print(f"   Error response: {response.text}")
+                raise Exception(f"Yandex API error {response.status_code}: {response.text}")
+            
+            data = response.json()
+            
+            if "embedding" in data:
+                return data["embedding"]
+            else:
+                raise Exception(f"Unexpected response format: {data}")
+                
+        except requests.exceptions.RequestException as e:
+            print(f"   Request error: {e}")
+            raise
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        results = []
+        total = len(texts)
+        for idx, text in enumerate(texts):
+            print(f"   Processing document {idx+1}/{total}...")
+            results.append(self.embed_query(text))
+            if idx < total - 1:
+                time.sleep(self.delay)
+        return results
+
+
+class YandexEmbeddingComponent(LCEmbeddingsModel):
+    display_name = "Yandex Cloud Embeddings"
+    description = "Generate embeddings using Yandex Cloud API"
+    documentation: str = "https://aistudio.yandex.ru/ru/docs/ai-studio/concepts/embeddings"
+    icon = "cloud"
+    name = "YandexEmbedding"
+    category = "models"
+    
+    inputs = [
+        SecretStrInput(
+            name="api_key",
+            display_name="API Key",
+            info="Your Yandex Cloud API key",
+            required=True,
+        ),
+        StrInput(
+            name="folder_id",
+            display_name="Folder ID",
+            info="Your Yandex Cloud folder ID",
+            required=True,
+        ),
+        StrInput(
+            name="model",
+            display_name="Model",
+            info="Full model URI (e.g., emb://folder_id/text-embeddings-v2-doc/latest)",
+            value="emb://folder_id/text-embeddings-v2-doc/latest",
+            required=True,
+        ),
+        StrInput(
+            name="base_url",
+            display_name="API Base URL",
+            info="Full API endpoint URL",
+            value="https://llm.api.cloud.yandex.net/foundationModels/v1/textEmbedding",
+            advanced=True,
+        ),
+        IntInput(
+            name="dimensions",
+            display_name="Dimensions",
+            info="The number of dimensions for embeddings (optional)",
+            advanced=True,
+        ),
+        FloatInput(
+            name="delay",
+            display_name="Delay between requests (seconds)",
+            info="Delay to avoid rate limits (Yandex allows 10 req/sec)",
+            value=0.2,
+            advanced=True,
+        ),
+    ]
+
+    def build_embeddings(self) -> Embeddings:
+        print("=== Building Yandex Cloud Embeddings ===")
+        print(f"Model: {self.model}")
+        print(f"Base URL: {self.base_url}")
+        print(f"Dimensions: {self.dimensions}")
+        print(f"Folder ID: {self.folder_id}")
+        print(f"Delay: {self.delay}")
+        
+        return YandexCloudEmbeddings(
+            api_key=self.api_key,
+            folder_id=self.folder_id,
+            model=self.model,
+            base_url=self.base_url,
+            dimensions=self.dimensions,
+            delay=self.delay,
+        )
