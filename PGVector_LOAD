@@ -4,19 +4,18 @@ from lfx.helpers.data import docs_to_data
 from lfx.io import HandleInput, IntInput, SecretStrInput, StrInput
 from lfx.schema.data import Data
 from lfx.utils.connection_string_parser import transform_connection_string
-# Импортируем утилиту для принудительной сериализации данных
-from langflow.serialization import serialize 
+from langflow.serialization import serialize # Импортируем утилиту для принудительной сериализации данных
 
 
 class PGVectorStoreComponent(LCVectorStoreComponent):
-    display_name = "PGVector"
+    display_name = "PGVector_Load"
     description = "PGVector Vector Store with search capabilities"
     name = "pgvector"
     icon = "cpu"
 
     inputs = [
         SecretStrInput(name="pg_server_url", display_name="PostgreSQL Server Connection String", required=True),
-        StrInput(name="collection_name", display_name="Table", required=True),
+        StrInput(name="collection_name", display_name="Collection", required=True),
         *LCVectorStoreComponent.inputs,
         HandleInput(name="embedding", display_name="Embedding", input_types=["Embeddings"], required=True),
         IntInput(
@@ -25,6 +24,12 @@ class PGVectorStoreComponent(LCVectorStoreComponent):
             info="Number of results to return.",
             value=4,
             advanced=True,
+        ),
+        StrInput(
+            name="search_query",
+            display_name="Search Query",
+            info="The query to search for.",
+            advanced=True,  
         ),
     ]
 
