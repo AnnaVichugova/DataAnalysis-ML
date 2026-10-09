@@ -1,79 +1,68 @@
 from lfx.base.embeddings.model import LCEmbeddingsModel
 from lfx.field_typing import Embeddings
 from lfx.io import (
-    SecretStrInput,
     StrInput,
     IntInput,
     FloatInput,
 )
-from langchain_core.embeddings import Embeddings
 from typing import List
 import requests
 import json
 import time
 import os
 
-class YandexCloudEmbeddings(Embeddings):
+class YandexCloudEmbeddingsEngine:
     def __init__(
         self,
         api_key: str,
         folder_id: str,
-        model: str,
+        model_family: str,
         base_url: str,
         dimensions: int = None,
         delay: float = 0.2
     ):
-        self.api_key = api_key
-        self.folder_id = folder_id
-        self.model = model
-        self.base_url = base_url
+        self.api_key = api_key.strip()
+        # Очищаем folder_id от случайных слэшей, пробелов и префиксов протокола
+        self.folder_id = folder_id.strip().split('/')[-1]
+        # Очищаем базовое имя модели от возможных хвостов
+        self.model_family = model_family.strip().replace("-doc", "").replace("-query", "").replace("/latest", "").strip("/")
+        self.base_url = base_url[:-1] if base_url.endswith('/') else base_url
         self.dimensions = dimensions
         self.delay = delay
-        
-        if self.base_url.endswith('/'):
-            self.base_url = self.base_url[:-1]
         self.endpoint = self.base_url
         
-    def embed_query(self, text: str) -> List[float]:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
+    def _get_headers(self) -> dict:
+        auth_header = f"Bearer {self.api_key}" if self.api_key.startswith("t1.") else f"Api-Key {self.api_key}"
+        return {
+            "Authorization": auth_header,
             "x-folder-id": self.folder_id,
             "Content-Type": "application/json"
         }
-        
+
+    def _execute_request(self, text: str, model_uri: str) -> List[float]:
         payload = {
-            "modelUri": self.model,
+            "modelUri": model_uri,
             "text": text
         }
-        
         if self.dimensions:
             payload["dimensions"] = self.dimensions
-        
-        print(f"   Sending to Yandex: {self.endpoint}")
-        print(f"   Headers: x-folder-id={self.folder_id}")
-        print(f"   Payload: {json.dumps(payload, ensure_ascii=False)}")
-        
+            
         try:
             response = requests.post(
                 self.endpoint,
-                headers=headers,
+                headers=self._get_headers(),
                 json=payload,
                 timeout=60
             )
             
-            print(f"   Response status: {response.status_code}")
-            
             if response.status_code == 429:
-                print(f"   Rate limit hit, waiting 1 second...")
                 time.sleep(1)
-                return self.embed_query(text)
+                return self._execute_request(text, model_uri)
             
             if response.status_code != 200:
-                print(f"   Error response: {response.text}")
                 raise Exception(f"Yandex API error {response.status_code}: {response.text}")
             
             data = response.json()
-            
             if "embedding" in data:
                 return data["embedding"]
             else:
@@ -82,22 +71,35 @@ class YandexCloudEmbeddings(Embeddings):
         except requests.exceptions.RequestException as e:
             print(f"   Request error: {e}")
             raise
+
+    def embed_query(self, text: str) -> List[float]:
+        """Генерация вектора для ПОИСКОВОГО ЗАПРОСА (авто-подстановка -query)"""
+        suffix = "-query" if "-v" in self.model_family else "-search-query"
+        model_uri = f"emb://{self.folder_id}/{self.model_family}{suffix}/latest"
+        
+        print(f"   [Yandex Search] Vectorizing QUERY via: {model_uri}")
+        return self._execute_request(text, model_uri)
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Генерация векторов для БАЗЫ ДОКУМЕНТОВ (авто-подстановка -doc)"""
+        suffix = "-doc" if "-v" in self.model_family else "-search-doc"
+        model_uri = f"emb://{self.folder_id}/{self.model_family}{suffix}/latest"
+        
+        print(f"   [Yandex Index] Vectorizing DOCUMENTS via: {model_uri}")
+        
         results = []
         total = len(texts)
         for idx, text in enumerate(texts):
-            print(f"   Processing document {idx+1}/{total}...")
-            results.append(self.embed_query(text))
+            results.append(self._execute_request(text, model_uri))
             if idx < total - 1:
                 time.sleep(self.delay)
         return results
 
 
 class YandexEmbeddingComponent(LCEmbeddingsModel):
-    display_name = "Yandex Cloud Embeddings (Lite UX from ENV)"
-    description = "Generate embeddings using Yandex Cloud API"
-    documentation: str = "https://aistudio.yandex.ru/ru/docs/ai-studio/concepts/embeddings"
+    display_name = "Yandex Cloud Embeddings"
+    description = "Генерация embedding-векторов с Yandex Cloud API (ID каталога из переменных среды)"
+    documentation: str = "https://yandex.ru"
     icon = "cloud"
     name = "YandexEmbedding"
     category = "models"
@@ -105,23 +107,23 @@ class YandexEmbeddingComponent(LCEmbeddingsModel):
     inputs = [
         StrInput(
             name="model",
-            display_name="Model",
-            info="Идентификатор модели Yandex (например, text-embeddings-v2-doc или text-embeddings-v3)",
-            value="text-embeddings-v2-doc/latest", 
+            display_name="Model Family",
+            info="Семейство моделей без префиксов каталога и суффиксов (например: text-embeddings-v2 или text-embeddings-v3)",
+            value="text-embeddings-v2",
             required=True,
         ),
         StrInput(
             name="base_url",
             display_name="API Base URL",
             info="Full API endpoint URL",
-            value="https://llm.api.cloud.yandex.net/foundationModels/v1/textEmbedding",
+            value="https://yandex.net",
             advanced=True,
         ),
         IntInput(
             name="dimensions",
             display_name="Dimensions",
             info="The number of dimensions for embeddings (optional)",
-            value=256,            
+            value=256,
             advanced=True,
         ),
         FloatInput(
@@ -134,19 +136,20 @@ class YandexEmbeddingComponent(LCEmbeddingsModel):
     ]
 
     def build_embeddings(self) -> Embeddings:
-        
-        env_api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("YANDEX_API_KEY", "")
+        env_api_key = os.environ.get("YANDEX_API_KEY", "")
         env_folder_id = os.environ.get("YANDEX_FOLDER_ID", "")
         
-        final_model_uri = self.model
-        if env_folder_id and not final_model_uri.startswith("emb://"):
-            model_path = final_model_uri.lstrip("/")
-            final_model_uri = f"emb://{env_folder_id}/{model_path}"
-        
-        return YandexCloudEmbeddings(
+        if not env_api_key or not env_folder_id:
+            raise ValueError(
+                "Ошибка: Проверьте переменные окружения! "
+                "Необходимо установить YANDEX_API_KEY и YANDEX_FOLDER_ID."
+            )
+
+        print("=== Building Yandex Cloud Embeddings from ENV ===")
+        return YandexCloudEmbeddingsEngine(
             api_key=env_api_key,
             folder_id=env_folder_id,
-            model=final_model_uri, 
+            model_family=self.model,
             base_url=self.base_url,
             dimensions=self.dimensions,
             delay=self.delay,
