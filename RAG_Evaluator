@@ -1,7 +1,7 @@
 import os
 import re
-import requests
 import json
+import requests
 from langflow.custom import Component
 from langflow.io import MessageInput, StrInput, Output
 from langflow.schema import Data
@@ -16,9 +16,9 @@ class CleanlabRAGEvaluatorYandex(Component):
         MessageInput(name="contexts", display_name="Извлеченный контекст (Contexts)", info="Текст документов из Parser / PGVector"),
         MessageInput(name="response", display_name="Ответ модели (Response)", info="Ответ из Language Model"),
         StrInput(
-            name="model", 
-            display_name="Model (Full URI)", 
-            info="Полный идентификатор модели в формате gpt://<folder_id>/<model_name>/latest", 
+            name="model",
+            display_name="Model (Full URI)",
+            info="Полный идентификатор модели в формате gpt://<folder_id>/<model_name>/latest",
             value="gpt-oss-20b/latest",
             required=True,
         ),
@@ -28,6 +28,22 @@ class CleanlabRAGEvaluatorYandex(Component):
             info="Полный URL OpenAI-совместимого эндпоинта",
             value="https://llm.api.cloud.yandex.net/v1/chat/completions",
             required=True,
+        ),
+        StrInput(
+            name="session_id",
+            display_name="Session ID (для Phoenix)",
+            info="Идентификатор сессии из API-запроса. Используется для привязки аннотаций в Phoenix.",
+            value="",
+            required=False,
+            advanced=True,
+        ),
+        StrInput(
+            name="phoenix_url",
+            display_name="Phoenix URL",
+            info="Базовый URL Phoenix для отправки аннотаций",
+            value="http://host.docker.internal:9004",
+            required=False,
+            advanced=True,
         ),
     ]
 
@@ -41,10 +57,10 @@ class CleanlabRAGEvaluatorYandex(Component):
             return ""
         if isinstance(obj, str):
             return obj
-        
+
         if hasattr(obj, "text") and obj.text:
             return str(obj.text)
-            
+
         if isinstance(obj, dict):
             if "text" in obj and isinstance(obj["text"], str):
                 return obj["text"]
@@ -69,11 +85,40 @@ class CleanlabRAGEvaluatorYandex(Component):
 
         if isinstance(obj, list):
             return "\n".join([self._extract_text(item) for item in obj if item])
-            
+
         if hasattr(obj, "value") and obj.value:
             return str(obj.value)
-            
+
         return str(obj)
+
+    def _send_phoenix_session_annotation(self, session_id: str, name: str, score: float, explanation: str) -> None:
+        """Отправка session-аннотации в Phoenix через REST API."""
+        base = (self.phoenix_url or "http://host.docker.internal:9004").strip().rstrip("/")
+        url = f"{base}/v1/session_annotations"
+
+        api_key = os.environ.get("PHOENIX_API_KEY", "").strip()
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload = {
+            "data": [{
+                "session_id": session_id,
+                "name": name,
+                "annotator_kind": "LLM",
+                "result": {
+                    "score": float(score),
+                    "explanation": explanation,
+                },
+            }]
+        }
+
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=10)
+            print(f"[Phoenix Session] {name} -> HTTP {r.status_code}: {r.text[:300]}")
+        except Exception as e:
+            print(f"[Phoenix Session] {name} -> ERROR {type(e).__name__}: {e}")
 
     def evaluate_rag(self) -> Data:
         # Извлекаем очищенные текстовые данные
@@ -81,16 +126,15 @@ class CleanlabRAGEvaluatorYandex(Component):
         clean_contexts = self._extract_text(self.contexts)
         clean_response = self._extract_text(self.response)
 
-        # Берем учетные данные из переменных окружения
+        # Учетные данные Yandex Cloud
         env_api_key = os.environ.get("YANDEX_API_KEY", "")
         env_folder_id = os.environ.get("YANDEX_FOLDER_ID", "")
 
         if not env_api_key or not env_folder_id:
             return Data(value="Ошибка: Установите переменные окружения YANDEX_API_KEY и YANDEX_FOLDER_ID!")
 
-        # URL эндпоинта берется из поля ввода
         endpoint = self.endpoint_url.strip() if self.endpoint_url else "https://llm.api.cloud.yandex.net/v1/chat/completions"
-        
+
         headers = {
             "Authorization": f"Bearer {env_api_key}",
             "Content-Type": "application/json"
@@ -102,7 +146,7 @@ class CleanlabRAGEvaluatorYandex(Component):
             model_path = final_model_uri.lstrip("/")
             final_model_uri = f"gpt://{env_folder_id}/{model_path}"
 
-        # Строгий экспертный промпт
+        # Промпт
         prompt = (
             f"Ты строгий эксперт-судья по RAG-системам. Оцени предоставленный конвейер по двум метрикам:\n"
             f"1. Обоснованность (Faithfulness): Насколько Ответ подтверждается Контекстом (выставь оценку от 0 до 1 и кратко обоснуй).\n"
@@ -118,11 +162,11 @@ class CleanlabRAGEvaluatorYandex(Component):
             "max_tokens": 2000,
             "messages": [
                 {
-                    "role": "system", 
+                    "role": "system",
                     "content": "Отвечай строго структурированно. Обязательно начни ответ с ключевых слов ровно в таком формате:\nОбоснованность: [оценка от 0 до 1]\nРелевантность: [оценка от 0 до 1]\nЗатем напиши краткое текстовое обоснование."
                 },
                 {
-                    "role": "user", 
+                    "role": "user",
                     "content": prompt
                 }
             ]
@@ -134,69 +178,56 @@ class CleanlabRAGEvaluatorYandex(Component):
 
         try:
             res = requests.post(endpoint, json=payload, headers=headers, timeout=60)
-            
+
             if res.status_code != 200:
                 raise Exception(f"Yandex OpenAI-API error {res.status_code}: {res.text}")
-                
+
             res_json = res.json()
-            
+
             if "choices" in res_json and isinstance(res_json["choices"], list) and len(res_json["choices"]) > 0:
                 first_choice = res_json["choices"][0]
                 if "message" in first_choice and "content" in first_choice["message"]:
                     output_result = first_choice["message"]["content"]
-            
+
             if not output_result:
                 output_result = json.dumps(res_json, ensure_ascii=False)
-                
+
         except Exception as e:
             output_result = f"Error calling Yandex OpenAI-API: {str(e)}"
 
-        # Поиск числовых оценок регулярными выражениями
+        # Парсинг оценок
         if output_result and not output_result.startswith("Error calling Yandex"):
             try:
                 faith_match = re.search(r'(?:Обоснованность|Faithfulness)\s*[:\-]?\s*(\d+(?:[.,]\d+)?)', output_result, re.IGNORECASE)
                 rel_match = re.search(r'(?:Релевантность|Relevance)\s*[:\-]?\s*(\d+(?:[.,]\d+)?)', output_result, re.IGNORECASE)
-                
+
                 if faith_match:
                     faithfulness_score = float(faith_match.group(1).replace(',', '.'))
                 if rel_match:
                     relevance_score = float(rel_match.group(1).replace(',', '.'))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Parse error] {type(e).__name__}: {e}")
 
-        # Логирование в Phoenix
+        # Логирование в Phoenix через session-аннотации
         if (faithfulness_score is not None or relevance_score is not None) and not output_result.startswith("Error calling Yandex"):
-            try:
-                import phoenix as px
-                from phoenix.trace import Evaluation
-                from openinference.instrumentation import get_current_span
-                
-                current_span = get_current_span()
-                if current_span and current_span.get_context():
-                    context = current_span.get_context()
-                    trace_id_str = format(context.trace_id, '032x')
-                    root_span_id_str = trace_id_str[-16:]
-                    
-                    px_client = px.Client(endpoint="http://phoenix:6006")
-                    evaluations_list = []
-                    
-                    if faithfulness_score is not None:
-                        evaluations_list.append(Evaluation(name="faithfulness", score=float(faithfulness_score), trace_id=trace_id_str, span_id=root_span_id_str, explanation=output_result))
-                    if relevance_score is not None:
-                        evaluations_list.append(Evaluation(name="answer_relevance", score=float(relevance_score), trace_id=trace_id_str, span_id=root_span_id_str, explanation=output_result))
-                    
-                    if evaluations_list:
-                        px_client.log_evaluations(evaluations_list)
-            except Exception:
-                pass
+            session_id = (self.session_id or "").strip()
+            if not session_id:
+                print("[Phoenix] session_id не задан, аннотации не отправлены")
+            else:
+                print(f"[Phoenix] Отправка session-аннотаций для session_id={session_id}")
 
+                if faithfulness_score is not None:
+                    self._send_phoenix_session_annotation(
+                        session_id, "faithfulness", faithfulness_score, output_result
+                    )
+                if relevance_score is not None:
+                    self._send_phoenix_session_annotation(
+                        session_id, "answer_relevance", relevance_score, output_result
+                    )
+
+        # Метаданные — только то, что реально полезно
         meta = {
-            "faithfulness": str(faithfulness_score), 
-            "relevance": str(relevance_score),
-            "model_uri": final_model_uri,
-            "endpoint_url": endpoint,
-            "query_len": len(clean_query),
-            "context_len": len(clean_contexts),
-            "response_len": len(clean_response)
+            "faithfulness": faithfulness_score,
+            "relevance": relevance_score,
         }
         return Data(value=output_result, metadata=meta)
