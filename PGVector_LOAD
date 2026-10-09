@@ -4,7 +4,7 @@ from lfx.helpers.data import docs_to_data
 from lfx.io import HandleInput, IntInput, SecretStrInput, StrInput
 from lfx.schema.data import Data
 from lfx.utils.connection_string_parser import transform_connection_string
-from langflow.serialization import serialize # Импортируем утилиту для принудительной сериализации данных
+from langflow.serialization import serialize  # Импортируем утилиту для принудительной сериализации данных
 
 
 class PGVectorStoreComponent(LCVectorStoreComponent):
