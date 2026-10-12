@@ -225,7 +225,6 @@ class CleanlabRAGEvaluatorYandex(Component):
                         session_id, "answer_relevance", relevance_score, output_result
                     )
 
-        # Метаданные — только то, что реально полезно
         meta = {
             "faithfulness": faithfulness_score,
             "relevance": relevance_score,
