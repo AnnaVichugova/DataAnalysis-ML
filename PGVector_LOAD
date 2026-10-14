@@ -29,14 +29,43 @@ class PGVectorStoreComponent(LCVectorStoreComponent):
         for _input in self.ingest_data or []:
             doc = _input.to_lc_document() if isinstance(_input, Data) else _input
             
-            # ИСПРАВЛЕНИЕ: Безопасная обработка метаданных без serialize в строку
             if hasattr(doc, "metadata") and doc.metadata:
-                if not isinstance(doc.metadata, dict):
+                # 1. Если метаданные пришли строкой — парсим в dict
+                if isinstance(doc.metadata, str):
                     try:
-                        doc.metadata = json.loads(doc.metadata) if isinstance(doc.metadata, str) else {}
+                        doc.metadata = json.loads(doc.metadata)
                     except Exception:
                         doc.metadata = {}
+                
+                # 2. Если это объект с методом конвертации (например, pydantic / Properties)
+                elif hasattr(doc.metadata, "dict") and callable(getattr(doc.metadata, "dict")):
+                    doc.metadata = doc.metadata.dict()
+                elif hasattr(doc.metadata, "model_dump") and callable(getattr(doc.metadata, "model_dump")):
+                    doc.metadata = doc.metadata.model_dump()
+                
+                # 3. Гарантируем, что это dict, и чистим его внутренности от не-JSON объектов
+                if isinstance(doc.metadata, dict):
+                    clean_metadata = {}
+                    for k, v in doc.metadata.items():
+                        try:
+                            # Проверяем, сериализуемо ли конкретное значение
+                            json.dumps(v)
+                            clean_metadata[k] = v
+                        except TypeError:
+                            # Если значение — объект Properties (или другой сложный класс)
+                            if hasattr(v, "dict") and callable(getattr(v, "dict")):
+                                clean_metadata[k] = v.dict()
+                            elif hasattr(v, "model_dump") and callable(getattr(v, "model_dump")):
+                                clean_metadata[k] = v.model_dump()
+                            else:
+                                # В крайнем случае приводим к строке, чтобы избежать падения базы
+                                clean_metadata[k] = str(v)
+                    doc.metadata = clean_metadata
+                else:
+                    doc.metadata = {}
+                    
             documents.append(doc)
+
 
         conn_str = transform_connection_string(self.pg_server_url)
 
