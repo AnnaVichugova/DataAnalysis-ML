@@ -1,0 +1,1488 @@
+# ============================================================ #
+# ЯЧЕЙКА 0: Установка и импорт
+# ============================================================ #
+# В Google Colab выполнить один раз. В локальной IDE — пропустить.
+
+!pip install -q pm4py pandas matplotlib seaborn networkx
+
+import os
+import random
+import pprint
+import statistics
+from datetime import datetime, timedelta
+from xml.sax.saxutils import escape
+from copy import deepcopy
+from collections import defaultdict, Counter
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import networkx as nx
+import matplotlib.pyplot as plt
+from IPython.display import Image, display
+
+# PM4PY импорты
+import pm4py
+from pm4py.util import xes_constants as xes
+from pm4py.objects.log.importer.xes import importer as xes_importer
+from pm4py.objects.log.exporter.xes import exporter as xes_exporter
+from pm4py.objects.petri_net import utils as pn_utils
+from pm4py.objects.petri_net.importer import importer as pn_importer
+from pm4py.objects.conversion.bpmn import converter as bpmn_converter
+from pm4py.algo.discovery.alpha import algorithm as alpha_miner
+from pm4py.algo.discovery.inductive import algorithm as inductive_miner
+from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
+from pm4py.algo.filtering.log.variants import variants_filter
+from pm4py.algo.evaluation.precision import algorithm as precision_evaluator
+from pm4py.algo.evaluation.replay_fitness import algorithm as fitness_evaluator
+from pm4py.statistics.variants.log import get as variants_get
+from pm4py.statistics.traces.generic.log import case_statistics
+from pm4py.statistics.attributes.log import get as attr_get
+
+# Настройка генератора случайных чисел
+random.seed(42)
+np.random.seed(42)
+
+print(f"pm4py version: {pm4py.__version__}")
+
+
+# ============================================================
+# ЯЧЕЙКА 1: ГЕНЕРАТОР XES ДЛЯ 4 КЕЙСОВ (полный цикл везде)
+# ============================================================
+# У ВСЕХ кейсов два типа трейсов:
+#   • batch — производственный процесс (R&D / дизайн / методология / разработка)
+#   • order — процесс выполнения заказа/проекта/транзакции
+
+
+# ============================================================
+# CONFIG: настройки XES под кейс (везде полный цикл)
+# ============================================================
+XES_CONFIG = {
+
+    # ---------- КЕЙС 1: BioGlow (косметика полного цикла) ----------
+    'bioglow': {
+        'facts': 'orders.csv',
+        'entities': 'customers.csv',
+        'ref': 'products.csv',
+        'trace_id_col': 'order_id',
+        'entity_col': 'customer_id',
+        'date_col': 'sale_date',
+        'ref_col': 'product_id',
+        'cost_col': 'production_cost',
+        'amount_fn': lambda r: r['sales_price'] * r['quantity'],
+        'multi_trace': True,
+
+        'batch_start_event_name': 'Партия запущена в производство',
+        'batch_end_event_name':   'Партия готова к продаже',
+        'batch_start_system':     'Factory',
+        'batch_end_system':       'WMS',
+        'start_event_name':       'Заказ получен',
+        'end_event_name':         'Заказ доставлен',
+        'start_system':           'CRM',
+        'end_system':             'CRM',
+
+        'batch_activities': [
+            ('Разработка рецептуры (R&D)', 'Lab', 'Технолог', 2880),
+            ('Закупка сырья', 'ERP', 'Снабженец', 1440),
+            ('Производство партии', 'Factory', 'Оператор линии', 720),
+            ('Контроль качества партии (ОТК)', 'QC', 'Контролёр ОТК', 240),
+            ('Маркировка и первичная упаковка', 'Factory', 'Упаковщик', 180),
+            ('Размещение на складе', 'WMS', 'Кладовщик', 120),
+        ],
+        'order_activities': [
+            ('Приём и верификация заказа', 'CRM', 'Менеджер', 8),
+            ('Проверка остатков на складе', 'WMS', 'Кладовщик', 12),
+            ('Комплектация заказа', 'WMS', 'Сборщик', 25),
+            ('Контроль качества заказа (ОТК)', 'QC', 'Контролёр ОТК', 15),
+            ('Брендированная упаковка', 'WMS', 'Упаковщик', 10),
+            ('Передача в логистику', 'Logistics', 'Логист', 20),
+            ('Финальная доставка', 'Delivery', 'Курьер', 60),
+        ],
+        'channels': {
+            'Online Store': ('Веб-магазин', 'CH1'),
+            'Marketplace': ('Маркетплейс', 'CH2'),
+            'B2B Wholesalers': ('B2B-опт', 'CH3'),
+        },
+        'extra_attrs': ['category', 'customer_type'],
+    },
+
+    # ---------- КЕЙС 2: Thread&Trend (одежда полного цикла) ----------
+    'threadtrend': {
+        'facts': 'orders.csv',
+        'entities': 'customers.csv',
+        'ref': 'products.csv',
+        'trace_id_col': 'order_id',
+        'entity_col': 'customer_id',
+        'date_col': 'sale_date',
+        'ref_col': 'product_id',
+        'cost_col': 'production_cost',
+        'amount_fn': lambda r: r['sales_price'] * r['quantity'] * (1 - r.get('returned', 0)),
+        'return_flag': 'returned',
+        'multi_trace': True,
+
+        'batch_start_event_name': 'Капсула запущена в производство',
+        'batch_end_event_name':   'Партия передана на склад',
+        'batch_start_system':     'PLM',
+        'batch_end_system':       'WMS',
+        'start_event_name':       'Заказ поступил',
+        'end_event_name':         'Изделие вручено клиенту',
+        'start_system':           'ERP',
+        'end_system':             'Delivery',
+
+        # Производственный процесс одежды
+        'batch_activities': [
+            ('Разработка дизайн-капсулы', 'PLM', 'Дизайнер', 4320),
+            ('Закупка ткани и фурнитуры', 'ERP', 'Снабженец', 2160),
+            ('Раскрой ткани', 'CAD', 'Закройщик', 480),
+            ('Пошив партии', 'Sewing', 'Швея', 1440),
+            ('Контроль ОТК партии и ВТО', 'QC', 'Контролёр ОТК', 480),
+            ('Маркировка «Честный Знак»', 'Packing', 'Маркировщик', 240),
+            ('Размещение на складе', 'WMS', 'Кладовщик', 180),
+        ],
+        'order_activities': [
+            ('Приём и обработка заказа', 'ERP', 'Менеджер', 10),
+            ('Проверка запасов на складе', 'WMS', 'Кладовщик', 20),
+            ('Комплектация и отбор размера', 'WMS', 'Сборщик', 25),
+            ('Контроль ОТК заказа', 'QC', 'Контролёр ОТК', 15),
+            ('Брендированная упаковка', 'Packing', 'Упаковщик', 15),
+            ('Передача в доставку', 'Logistics', 'Логист', 20),
+            ('Доставка и примерка', 'Delivery', 'Курьер', 90),
+        ],
+        'channels': {
+            'Online Store & App': ('Интернет-магазин', 'CH1'),
+            'Marketplace': ('Маркетплейс', 'CH2'),
+            'B2B Wholesalers': ('B2B-опт', 'CH3'),
+        },
+        'extra_attrs': ['category', 'customer_type'],
+    },
+
+    # ---------- КЕЙС 3: BPI Group (консалтинг полного цикла) ----------
+    'bpigroup': {
+        'facts': 'projects.csv',
+        'entities': 'clients.csv',
+        'ref': 'services.csv',
+        'trace_id_col': 'project_id',
+        'entity_col': 'client_id',
+        'date_col': 'start_date',
+        'ref_col': 'service_id',
+        'cost_col': 'standard_cost',
+        'amount_fn': lambda r: r['contract_value'],
+        'scope_flag': 'scope_creep',
+        'qa_col': 'qa_iterations',
+        'multi_trace': True,
+
+        'batch_start_event_name': 'Практика запущена в разработку',
+        'batch_end_event_name':   'Практика готова к продаже',
+        'batch_start_system':     'KnowledgeBase',
+        'batch_end_system':       'CRM',
+        'start_event_name':       'Запрос клиента получен',
+        'end_event_name':         'Проект закрыт',
+        'start_system':           'CRM',
+        'end_system':             'CRM',
+
+        # Производственный процесс консалтинговой практики (R&D методологии)
+        'batch_activities': [
+            ('Исследование рынка и трендов', 'KnowledgeBase', 'Методолог', 4320),
+            ('Разработка методологии', 'KnowledgeBase', 'Методолог', 5760),
+            ('Пилотирование на проекте', 'Consulting', 'Ведущий консультант', 2880),
+            ('Внутренний аудит практики (QA)', 'QA', 'QA-лид', 720),
+            ('Оформление методологии и шаблонов', 'Docflow', 'Методолог', 960),
+            ('Выпуск практики', 'CRM', 'Партнёр', 240),
+        ],
+        'order_activities': [
+            ('Идея и концепт проекта', 'CRM', 'Партнёр', 240),
+            ('Коммерческое предложение', 'CRM', 'Сейлз', 180),
+            ('Согласование договора', 'Docflow', 'Юрист', 300),
+            ('Сбор данных у клиента', 'Consulting', 'Консультант', 480),
+            ('Разработка решения', 'Consulting', 'Консультант', 960),
+            ('Внутренний аудит качества (QA)', 'QA', 'QA-лид', 240),
+            ('Согласование с клиентом', 'Docflow', 'Партнёр', 360),
+            ('Сдача проекта', 'CRM', 'Партнёр', 120),
+        ],
+        'channels': {
+            'Direct Sales': ('Прямые продажи', 'CH1'),
+            'Tender/RFP': ('Тендер', 'CH2'),
+            'Partners & Referral': ('Партнёры', 'CH3'),
+        },
+        'extra_attrs': ['industry', 'company_size'],
+    },
+
+    # ---------- КЕЙС 4: PixelPulse Games (полный цикл геймдева) ----------
+    'pixelpulse': {
+        'facts': 'releases.csv',
+        'entities': 'players.csv',
+        'ref': 'games.csv',
+        'trace_id_col': 'transaction_id',
+        'entity_col': 'player_id',
+        'date_col': 'event_date',
+        'ref_col': 'game_id',
+        'cost_col': None,
+        'amount_fn': lambda r: r['amount_usd'],
+        'qa_flag': 'qa_failed',
+        'ab_col': 'ab_test_days',
+        'multi_trace': True,
+
+        'batch_start_event_name': 'Игра запущена в разработку',
+        'batch_end_event_name':   'Игра готова к оперированию',
+        'batch_start_system':     'Jira',
+        'batch_end_system':       'LiveOps',
+        'start_event_name':       'Фича инициирована',
+        'end_event_name':         'Фича в LiveOps',
+        'start_system':           'Jira',
+        'end_system':             'LiveOps',
+
+        # Производственный процесс игры (создание тайтла)
+        'batch_activities': [
+            ('Концепт игры и жанровый анализ', 'Jira', 'Продюсер', 4320),
+            ('Прототипирование геймплея', 'Unity', 'Геймдизайнер', 5760),
+            ('Разработка арта и анимаций', 'ArtTool', 'Арт-директор', 8640),
+            ('Разработка клиента и сервера', 'Unity', 'Тимлид', 14400),
+            ('Soft Launch в тестовых гео', 'Analytics', 'Продюсер', 4320),
+            ('Внутреннее QA релиза', 'QA', 'QA-лид', 960),
+            ('Релиз в App Store / Google Play', 'AppStore', 'Релиз-менеджер', 240),
+        ],
+        'order_activities': [
+            ('Идея фичи / ивента', 'Jira', 'Геймдизайнер', 480),
+            ('Отрисовка ассетов (2D/3D)', 'ArtTool', 'Художник', 960),
+            ('Разработка кода', 'Unity', 'Программист', 1440),
+            ('Внутреннее тестирование QA', 'QA', 'QA-инженер', 480),
+            ('Soft Launch / AB-тест', 'Analytics', 'Продюсер', 2880),
+            ('Релиз в сторы', 'AppStore', 'Релиз-менеджер', 240),
+            ('LiveOps и поддержка', 'LiveOps', 'Community Manager', 720),
+        ],
+        'channels': {
+            'IAP': ('Внутриигровые покупки', 'CH1'),
+            'IAA': ('Реклама', 'CH1'),
+            'Subscription': ('Подписка', 'CH3'),
+        },
+        'extra_attrs': ['genre', 'player_type', 'ltv_segment'],
+    },
+}
+
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
+
+def _fmt_dt(dt):
+    return dt.strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def _add_event(parts, activity, resource, role, system,
+               ts_start, ts_end, extra_attrs=None):
+    parts.append('\t\t<event>')
+    parts.append(f'\t\t\t<string key="concept:name" value="{escape(str(activity))}" />')
+    parts.append(f'\t\t\t<string key="org:resource" value="{escape(str(resource))}" />')
+    parts.append(f'\t\t\t<string key="concept:role" value="{escape(str(role))}" />')
+    parts.append(f'\t\t\t<string key="concept:system" value="{escape(str(system))}" />')
+    parts.append(f'\t\t\t<string key="lifecycle:transition" value="complete" />')
+    parts.append(f'\t\t\t<date key="time:timestamp" value="{_fmt_dt(ts_start)}" />')
+    parts.append(f'\t\t\t<date key="timestamp:start" value="{_fmt_dt(ts_start)}" />')
+    parts.append(f'\t\t\t<date key="timestamp:end" value="{_fmt_dt(ts_end)}" />')
+    if extra_attrs:
+        for k, v in extra_attrs.items():
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                continue
+            if isinstance(v, (int, np.integer)):
+                parts.append(f'\t\t\t<int key="custom:{k}" value="{int(v)}" />')
+            elif isinstance(v, (float, np.floating)):
+                parts.append(f'\t\t\t<float key="custom:{k}" value="{v:.2f}" />')
+            else:
+                parts.append(f'\t\t\t<string key="custom:{k}" value="{escape(str(v))}" />')
+    parts.append('\t\t</event>')
+
+
+def _wrap_with_boundaries(cfg, kind='order'):
+    """Оборачивает activities start/end-событиями (имена из CONFIG)."""
+    if kind == 'batch':
+        acts = cfg['batch_activities']
+        start = (cfg['batch_start_event_name'], cfg['batch_start_system'], 'System', 0)
+        end   = (cfg['batch_end_event_name'],   cfg['batch_end_system'],   'System', 0)
+    else:
+        acts = cfg['order_activities']
+        start = (cfg['start_event_name'], cfg['start_system'], 'System', 0)
+        end   = (cfg['end_event_name'],   cfg['end_system'],   'System', 0)
+    return [start] + list(acts) + [end]
+
+
+def _prev_minutes(activities, idx):
+    if idx <= 0:
+        return 0
+    return activities[idx - 1][3]
+
+
+def _simulate_activities(parts, activities, base_dt, resources_pool,
+                          p_rework=0.15, p_skip=0.05, p_loopback=0.10,
+                          extra_trace_attrs=None):
+    current_dt = base_dt
+    for idx, (activity, system, role, base_minutes) in enumerate(activities):
+        if random.random() < p_skip and 0 < idx < len(activities) - 1 and base_minutes > 0:
+            continue
+
+        if base_minutes == 0:
+            resource = 'system'
+            duration = 0
+        else:
+            resource = random.choice(resources_pool[role])
+            duration = base_minutes * random.uniform(0.6, 1.8)
+
+        ts_start = current_dt
+        ts_end = ts_start + timedelta(minutes=duration)
+
+        _add_event(parts, activity, resource, role, system,
+                   ts_start, ts_end, extra_attrs=extra_trace_attrs)
+
+        current_dt = ts_end + timedelta(minutes=random.uniform(2, 30))
+
+        if base_minutes > 0 and ('ОТК' in activity or 'QA' in activity or 'качеств' in activity.lower()):
+            if random.random() < p_rework:
+                resource2 = random.choice(resources_pool[role])
+                ts_s = current_dt
+                ts_e = ts_s + timedelta(minutes=duration * 0.7)
+                _add_event(parts, activity + ' (повторно)',
+                           resource2, role, system, ts_s, ts_e,
+                           extra_attrs={'rework': 1})
+                current_dt = ts_e + timedelta(minutes=random.uniform(2, 15))
+
+        if (random.random() < p_loopback
+                and idx > 0
+                and base_minutes > 0
+                and _prev_minutes(activities, idx) > 0):
+            prev_act, prev_sys, prev_role, _ = activities[idx - 1]
+            resource3 = random.choice(resources_pool[prev_role])
+            ts_s = current_dt
+            ts_e = ts_s + timedelta(minutes=base_minutes * 0.4)
+            _add_event(parts, prev_act + ' (доработка)',
+                       resource3, prev_role, prev_sys, ts_s, ts_e,
+                       extra_attrs={'loopback': 1})
+            current_dt = ts_e + timedelta(minutes=random.uniform(2, 10))
+
+
+def generate_xes(case_key, output_path=None):
+    cfg = XES_CONFIG[case_key]
+    output_path = output_path or f'{case_key}_log.xes'
+
+    facts    = pd.read_csv(cfg['facts'], parse_dates=[cfg['date_col']])
+    entities = pd.read_csv(cfg['entities'])
+    ref      = pd.read_csv(cfg['ref'])
+
+    ref_cols = [cfg['ref_col']] + [c for c in cfg['extra_attrs'] if c in ref.columns]
+    if cfg.get('cost_col') and cfg['cost_col'] in ref.columns:
+        ref_cols.append(cfg['cost_col'])
+    df = facts.merge(ref[list(dict.fromkeys(ref_cols))], on=cfg['ref_col'], how='left')
+
+    ent_cols = [cfg['entity_col']] + [c for c in cfg['extra_attrs'] if c in entities.columns]
+    df = df.merge(entities[list(dict.fromkeys(ent_cols))], on=cfg['entity_col'], how='left')
+
+    df['_amount'] = cfg['amount_fn'](df)
+
+    # Пул ресурсов: batch + order + System
+    all_activities = list(cfg['batch_activities']) + list(cfg['order_activities'])
+    roles = sorted({a[2] for a in all_activities} | {'System'})
+    resources_pool = {role: [f'{role.lower().replace(" ", "-")}-{i:02d}'
+                             for i in range(1, 6)] for role in roles}
+
+    parts = [
+        '<?xml version="1.0" encoding="utf-8" ?>',
+        '<log xes.version="1849-2016" xes.features="nested-attributes" xmlns="http://www.xes-standard.org/">',
+    ]
+
+    # ---- batch-трейсы (для всех кейсов, multi_trace=True) ----
+    batch_map = {}
+    unique_refs = df[cfg['ref_col']].dropna().unique()
+    for ref_id in unique_refs:
+        first_sale = df[df[cfg['ref_col']] == ref_id][cfg['date_col']].min()
+        batch_start = first_sale - pd.Timedelta(days=int(random.uniform(60, 120)))
+        batch_id = f'BATCH-{ref_id}'
+        batch_map[ref_id] = (batch_id, batch_start.to_pydatetime())
+
+    batch_acts = _wrap_with_boundaries(cfg, kind='batch')
+    ref_info = ref.set_index(cfg['ref_col']).to_dict('index')
+
+    for ref_id, (batch_id, batch_start) in batch_map.items():
+        parts.append('\t<trace>')
+        parts.append(f'\t\t<string key="concept:name" value="{escape(batch_id)}" />')
+        parts.append(f'\t\t<string key="concept:instance" value="{escape(batch_id)}" />')
+        parts.append('\t\t<string key="custom:trace_type" value="batch" />')
+        parts.append(f'\t\t<string key="custom:ref_id" value="{escape(str(ref_id))}" />')
+        if ref_id in ref_info:
+            ri = ref_info[ref_id]
+            # Пытаемся вытащить «человеческое» имя продукта/услуги/игры
+            for name_key in ['product_name', 'service_name', 'game_name', 'name']:
+                if name_key in ri and pd.notna(ri[name_key]):
+                    parts.append(f'\t\t<string key="custom:ref_name" value="{escape(str(ri[name_key]))}" />')
+                    break
+            for cat_key in ['category', 'practice', 'genre']:
+                if cat_key in ri and pd.notna(ri[cat_key]):
+                    parts.append(f'\t\t<string key="custom:category" value="{escape(str(ri[cat_key]))}" />')
+                    break
+
+        _simulate_activities(parts, batch_acts, batch_start, resources_pool,
+                             p_rework=0.20, p_skip=0.02, p_loopback=0.05)
+        parts.append('\t</trace>')
+
+    # ---- order-трейсы (для всех кейсов) ----
+    order_acts = _wrap_with_boundaries(cfg, kind='order')
+
+    for _, row in df.iterrows():
+        trace_id = str(row[cfg['trace_id_col']])
+        parts.append('\t<trace>')
+        parts.append(f'\t\t<string key="concept:name" value="{escape(trace_id)}" />')
+        parts.append(f'\t\t<string key="concept:instance" value="{escape(trace_id)}" />')
+        parts.append('\t\t<string key="custom:trace_type" value="order" />')
+        parts.append(f'\t\t<string key="org:entity" value="{escape(str(row.get(cfg["entity_col"], "")))}" />')
+        parts.append(f'\t\t<float key="custom:amount" value="{float(row["_amount"]):.2f}" />')
+
+        # Ссылка на производственную партию
+        if row[cfg['ref_col']] in batch_map:
+            parts.append(f'\t\t<string key="custom:batch_id" value="{escape(batch_map[row[cfg["ref_col"]]][0])}" />')
+
+        # Канал
+        if 'sale_channel' in row and row['sale_channel'] in cfg['channels']:
+            label, ch_id = cfg['channels'][row['sale_channel']]
+            parts.append(f'\t\t<string key="custom:channel" value="{escape(label)}" />')
+            parts.append(f'\t\t<string key="custom:channel_id" value="{ch_id}" />')
+        elif 'revenue_type' in row and row['revenue_type'] in cfg['channels']:
+            label, ch_id = cfg['channels'][row['revenue_type']]
+            parts.append(f'\t\t<string key="custom:channel" value="{escape(label)}" />')
+            parts.append(f'\t\t<string key="custom:channel_id" value="{ch_id}" />')
+
+        for attr in cfg['extra_attrs']:
+            if attr in row and pd.notna(row[attr]):
+                parts.append(f'\t\t<string key="custom:{attr}" value="{escape(str(row[attr]))}" />')
+
+        for flag_name in ['return_flag', 'scope_flag', 'qa_flag']:
+            if flag_name in cfg and cfg[flag_name] in row:
+                val = row[cfg[flag_name]]
+                if pd.notna(val):
+                    parts.append(f'\t\t<int key="custom:{cfg[flag_name]}" value="{int(val)}" />')
+
+        base_dt = pd.to_datetime(row[cfg['date_col']]).to_pydatetime()
+        p_skip = 0.05
+        if 'sale_channel' in row and row['sale_channel'] == 'B2B Wholesalers':
+            p_skip = 0.25
+
+        _simulate_activities(parts, order_acts, base_dt, resources_pool,
+                             p_rework=0.15, p_skip=p_skip, p_loopback=0.10)
+
+        parts.append('\t</trace>')
+
+    parts.append('</log>')
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(parts))
+
+    n_traces = sum(1 for line in parts if '<trace>' in line)
+    n_events = sum(1 for line in parts if '<event>' in line)
+    size_kb = os.path.getsize(output_path) / 1024
+
+    print(f" {output_path}")
+    print(f"   трейсов: {n_traces}, событий: ~{n_events}, размер: {size_kb:.1f} KB")
+    print(f"   ├─ batch (производство): {len(batch_map)}")
+    print(f"   └─ order (продажа/проект/транзакция): {n_traces - len(batch_map)}")
+    return output_path
+
+
+# ============================================================
+# ЗАПУСК ГЕНЕРАЦИИ ДЛЯ ВСЕХ 4 КЕЙСОВ
+# ============================================================
+
+for case in ['bioglow', 'threadtrend', 'bpigroup', 'pixelpulse']:
+    cfg = XES_CONFIG.get(case)
+    if not cfg:
+        print(f"  Нет конфига для '{case}'")
+        continue
+
+    missing = [f for f in (cfg['facts'], cfg['entities'], cfg['ref'])
+               if not os.path.exists(f)]
+    if missing:
+        print(f"⏭  {case}: пропуск — нет файлов {missing}")
+        continue
+
+    print(f"\n--- {case} ---")
+    try:
+        generate_xes(case)
+    except Exception as e:
+        print(f" {case}: {type(e).__name__}: {e}")
+
+
+# ============================================================
+# ЯЧЕЙКА 2: Загрузка XES + разделение на batch / order + графики с подписями
+# ============================================================
+
+
+CASE = 'bioglow'
+LOG_PATH = f'{CASE}_log.xes'
+
+log_all = xes_importer.apply(LOG_PATH)
+print(f"Загружено: {len(log_all)} трейсов")
+print(f"Событий: {sum(len(t) for t in log_all)}")
+
+log_batch = pm4py.filter_trace_attribute_values(
+    log_all, 'custom:trace_type', ['batch'])
+log_order = pm4py.filter_trace_attribute_values(
+    log_all, 'custom:trace_type', ['order'])
+
+print(f"batch (производство): {len(log_batch)}")
+print(f"order (продажа):      {len(log_order)}")
+
+log = log_order
+# log = log_batch
+
+print(f"\nАнализ процесса: {len(log)} трейсов, "
+      f"{sum(len(t) for t in log)} событий")
+
+
+# ============================================================
+# Вспомогательные функции: графики с подписями
+# ============================================================
+
+def plot_events_per_time(log, title, subtitle):
+    """Плотность событий во времени: ось X — время, ось Y — число событий."""
+    # Считаем, сколько событий в каждый день
+    from collections import Counter
+    dates = []
+    for trace in log:
+        for event in trace:
+            ts = event.get('time:timestamp')
+            if ts:
+                dates.append(ts.date())
+
+    counts = Counter(dates)
+    dates_sorted = sorted(counts)
+    values = [counts[d] for d in dates_sorted]
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(dates_sorted, values, marker='o', linewidth=1, markersize=3)
+    ax.set_xlabel('Дата')
+    ax.set_ylabel('Число событий в день')
+    ax.set_title(f'{title}\n{subtitle}', fontsize=11, loc='left')
+    ax.grid(alpha=0.3)
+
+    # Пояснение под графиком
+    fig.text(0.01, -0.05,
+             'Как читать: пики — дни высокой нагрузки, провалы — простой '
+             '(выходные, ночь). Неровный график = неравномерная загрузка.',
+             fontsize=9, color='gray')
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_events_by_weekday(log, title, subtitle):
+    """Распределение событий по дням недели."""
+    from collections import Counter
+    days = []
+    for trace in log:
+        for event in trace:
+            ts = event.get('time:timestamp')
+            if ts:
+                days.append(ts.weekday())  # 0=Пн, 6=Вс
+
+    labels_ru = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+    counts = Counter(days)
+    values = [counts.get(i, 0) for i in range(7)]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bars = ax.bar(labels_ru, values, color='steelblue', edgecolor='black')
+    ax.set_xlabel('День недели')
+    ax.set_ylabel('Число событий')
+    ax.set_title(f'{title}\n{subtitle}', fontsize=11, loc='left')
+    ax.grid(alpha=0.3, axis='y')
+
+    # Подписи значений над столбцами
+    for bar, v in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, v, str(v),
+                ha='center', va='bottom', fontsize=9)
+
+    fig.text(0.01, -0.05,
+             'Как читать: высокие будни = B2B-ритм; высокие выходные = работа '
+             'без выходных. Резкий понедельник = накопление за выходные.',
+             fontsize=9, color='gray')
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_case_duration(log, title, subtitle):
+    """Распределение длительности кейсов (в часах)."""
+    durations = []
+    for trace in log:
+        events = sorted(trace, key=lambda e: e['time:timestamp'])
+        if len(events) >= 2:
+            dur = (events[-1]['time:timestamp']
+                   - events[0]['time:timestamp']).total_seconds() / 3600
+            durations.append(dur)
+
+    if not durations:
+        print("Нет трейсов с 2+ событиями")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.hist(durations, bins=40, color='coral', edgecolor='black', alpha=0.8)
+    ax.set_xlabel('Длительность кейса, часы')
+    ax.set_ylabel('Число кейсов')
+    ax.set_title(f'{title}\n{subtitle}', fontsize=11, loc='left')
+    ax.grid(alpha=0.3, axis='y')
+
+    # Линия медианы
+    median = sorted(durations)[len(durations) // 2]
+    ax.axvline(median, color='navy', linestyle='--', linewidth=1.5,
+               label=f'Медиана: {median:.1f} ч')
+    ax.legend()
+
+    fig.text(0.01, -0.05,
+             'Как читать: колокол = стабильный процесс; длинный правый хвост = '
+             'выбросы (rework, ожидание); две вершины = два сценария.',
+             fontsize=9, color='gray')
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# Строим три графика с подписями
+# ============================================================
+
+plot_events_per_time(
+    log,
+    title='Плотность событий во времени',
+    subtitle=f'{CASE} / {len(log)} трейсов, {sum(len(t) for t in log)} событий'
+)
+
+plot_events_by_weekday(
+    log,
+    title='Распределение событий по дням недели',
+    subtitle=f'{CASE} / {len(log)} трейсов'
+)
+
+plot_case_duration(
+    log,
+    title='Длительность кейсов',
+    subtitle=f'{CASE} / медиана, P95 и хвост выбросов видны сразу'
+)
+
+
+# ============================================================
+# ЯЧЕЙКА 3: BPMN с обогащёнными подписями и легендой
+# ============================================================
+
+
+# --- 1. Форматирование длительности ---
+def format_duration(minutes):
+    """Переводит минуты в человекочитаемый вид: '2 ч. 15 мин.'"""
+    if minutes >= 24 * 60:
+        days = minutes // (24 * 60)
+        rest = minutes % (24 * 60)
+        hours = rest // 60
+        mins = rest % 60
+        return f"{int(days)} дн. {int(hours)} ч. {int(mins)} мин."
+    if minutes >= 60:
+        return f"{int(minutes // 60)} ч. {int(minutes % 60)} мин."
+    return f"{minutes:.1f} мин"
+
+
+# --- 2. Считаем длительности и роли по активностям ---
+activity_durations = defaultdict(list)
+activity_performers = defaultdict(set)
+
+for trace in log:
+    for event in trace:
+        act = event['concept:name']
+        start = event.get('time:timestamp')
+        end = event.get('timestamp:end', start)
+        if start and end:
+            duration = (end - start).total_seconds() / 60
+            activity_durations[act].append(duration)
+        if 'concept:role' in event:
+            activity_performers[act].add(event['concept:role'])
+
+avg_durations = {a: statistics.mean(d) for a, d in activity_durations.items()}
+
+
+# --- 3. Обогащаем подписи (НЕ трогаем concept:name) ---
+# ВАЖНО: concept:name остаётся коротким, иначе conformance в ячейке 7
+# не найдёт ни одну активность в эталонной BPMN и покажет fitness = 0.
+for trace in log:
+    for event in trace:
+        act = event['concept:name']
+        roles = ', '.join(sorted(activity_performers[act])) or 'Не указан'
+        duration = avg_durations.get(act, 0)
+        event['custom:label'] = (
+            f"Задача: {act}\n\n"
+            f"Роль: {roles}\n"
+            f"Ср. длительность: {format_duration(duration)}"
+        )
+
+
+# --- 4. Строим BPMN ---
+bpmn_model = pm4py.discover_bpmn_inductive(log)
+
+# --- 5. Сохраняем в PNG и показываем с заголовком и легендой ---
+OUT_PNG = f'{CASE}_bpmn.png'
+try:
+    pm4py.save_vis_bpmn(bpmn_model, OUT_PNG, rankdir='LR')
+except Exception as e:
+    print(f"save_vis_bpmn упал: {type(e).__name__}: {e}")
+    print("Пробуем через view_bpmn...")
+    pm4py.view_bpmn(bpmn_model)
+
+# Заголовок перед картинкой
+print("=" * 70)
+print(f"BPMN-модель процесса — {CASE}")
+print("=" * 70)
+print("Круг           — начало или конец процесса")
+print("Прямоугольник  — задача (активность)")
+print("Ромб           — шлюз (ветвление или слияние потоков)")
+print("Стрелка        — поток управления: откуда → куда")
+print("В подписи задачи: роль исполнителя + средняя длительность")
+print("=" * 70)
+
+# Показываем картинку встроенно
+display(Image(filename=OUT_PNG))
+
+# ============================================================
+# ЯЧЕЙКА 4: Сеть Петри (Alpha Miner) с пояснением и статистикой
+# ============================================================
+
+# --- 1. Строим сеть Петри ---
+net, im, fm = alpha_miner.apply(log)
+
+# --- 2. Сохраняем в PNG ---
+OUT_PNG = f'{CASE}_petri.png'
+try:
+    pm4py.save_vis_petri_net(net, im, fm, OUT_PNG)
+except Exception as e:
+    print(f"save_vis_petri_net упал: {type(e).__name__}: {e}")
+    pm4py.view_petri_net(net, im, fm)
+
+# --- 3. Заголовок и легенда перед картинкой ---
+print("=" * 70)
+print(f"Сеть Петри (Alpha Miner) — {CASE}")
+print("=" * 70)
+print("Круг              — позиция (состояние процесса)")
+print("Прямоугольник     — переход (активность)")
+print("Точка в круге     — начальная маркировка")
+print("Двойной круг      — конечная маркировка")
+print("Стрелки           — потоки токенов между позициями и переходами")
+print("=" * 70)
+
+# --- 4. Статистика сети ---
+n_places      = len(net.places)
+n_transitions = len(net.transitions)
+n_arcs        = len(net.arcs)
+
+start_transitions = [t.name for t in net.transitions
+                     if t.label and any(a.source == p for p in im
+                                        for a in net.arcs
+                                        if a.target == t and a.source == p)]
+end_transitions   = [t.name for t in net.transitions
+                     if t.label and any(a.target == p for p in fm
+                                        for a in net.arcs
+                                        if a.source == t and a.target == p)]
+
+print(f"Позиций (мест):        {n_places}")
+print(f"Переходов (активностей): {n_transitions}")
+print(f"Дуг (arcs):            {n_arcs}")
+print(f"Начальных позиций:     {len(im)}")
+print(f"Конечных позиций:      {len(fm)}")
+
+# --- 5. Список переходов (активностей) ---
+print("\nПереходы (активности) в сети:")
+for i, t in enumerate(sorted([t for t in net.transitions if t.label],
+                              key=lambda x: x.label), 1):
+    print(f"  {i:2d}. {t.label}")
+
+# --- 6. Показываем картинку ---
+display(Image(filename=OUT_PNG))
+
+# ============================================================
+# ЯЧЕЙКА 5: DFG — граф напрямую следующих событий
+# ============================================================
+
+# --- 1. Строим DFG ---
+dfg, start_activities, end_activities = pm4py.discover_dfg(log)
+
+# --- 2. Сохраняем в PNG ---
+OUT_PNG = f'{CASE}_dfg.png'
+try:
+    pm4py.save_vis_dfg(dfg, start_activities, end_activities, OUT_PNG)
+except Exception as e:
+    print(f"save_vis_dfg упал: {type(e).__name__}: {e}")
+    pm4py.view_dfg(dfg, start_activities, end_activities)
+
+# --- 3. Заголовок и легенда перед картинкой ---
+print("=" * 70)
+print(f"DFG — граф напрямую следующих событий — {CASE}")
+print("=" * 70)
+print("Прямоугольник        — активность")
+print("Стрелка A -> B       — в логе был переход A -> B")
+print("Число на стрелке     — сколько раз такой переход встретился")
+print("Зелёный кружок       — начальная активность трейса")
+print("Красный кружок       — конечная активность трейса")
+print("=" * 70)
+
+# --- 4. Статистика ---
+n_transitions_total = sum(dfg.values())
+n_unique_transitions = len(dfg)
+n_start_total = sum(start_activities.values())
+n_end_total = sum(end_activities.values())
+
+print(f"\nВсего переходов в логе:      {n_transitions_total}")
+print(f"Уникальных переходов (стрелок): {n_unique_transitions}")
+print(f"Начальных активностей:        {len(start_activities)} "
+      f"(всего стартов: {n_start_total})")
+print(f"Конечных активностей:         {len(end_activities)} "
+      f"(всего финишей: {n_end_total})")
+
+# --- 5. Начальные активности ---
+print(f"\nНачальные активности (топ-5):")
+print(f"{'Активность':<45} {'Раз':>6} {'Доля':>8}")
+print("-" * 62)
+for a, c in sorted(start_activities.items(), key=lambda x: -x[1])[:5]:
+    share = c / n_start_total * 100 if n_start_total else 0
+    short = a if len(a) <= 43 else a[:40] + '...'
+    print(f"{short:<45} {c:>6} {share:>7.1f}%")
+
+# --- 6. Конечные активности ---
+print(f"\nКонечные активности (топ-5):")
+print(f"{'Активность':<45} {'Раз':>6} {'Доля':>8}")
+print("-" * 62)
+for a, c in sorted(end_activities.items(), key=lambda x: -x[1])[:5]:
+    share = c / n_end_total * 100 if n_end_total else 0
+    short = a if len(a) <= 43 else a[:40] + '...'
+    print(f"{short:<45} {c:>6} {share:>7.1f}%")
+
+# --- 7. Топ-10 переходов ---
+print(f"\nТоп-10 переходов:")
+print(f"{'Откуда -> Куда':<70} {'Раз':>6} {'Доля':>8}")
+print("-" * 86)
+for (a, b), c in sorted(dfg.items(), key=lambda x: -x[1])[:10]:
+    share = c / n_transitions_total * 100 if n_transitions_total else 0
+    pair = f"{a} -> {b}"
+    short = pair if len(pair) <= 68 else pair[:65] + '...'
+    print(f"{short:<70} {c:>6} {share:>7.1f}%")
+
+# --- 8. Показываем картинку ---
+display(Image(filename=OUT_PNG))
+
+
+# ============================================================
+# ЯЧЕЙКА 6: Эвристическая сеть (Heuristics Miner)
+# ============================================================
+
+# --- 1. Строим эвристическую сеть ---
+heu_net = pm4py.discover_heuristics_net(log)
+
+# --- 2. Сохраняем в PNG ---
+OUT_PNG = f'{CASE}_heuristics.png'
+try:
+    pm4py.save_vis_heuristics_net(heu_net, OUT_PNG)
+except Exception as e:
+    print(f"save_vis_heuristics_net упал: {type(e).__name__}: {e}")
+    pm4py.view_heuristics_net(heu_net)
+
+# --- 3. Заголовок и легенда ---
+print("=" * 70)
+print(f"Эвристическая сеть (Heuristics Miner) — {CASE}")
+print("=" * 70)
+print("Прямоугольник        — активность")
+print("Стрелка A -> B       — зависимость: после A часто идёт B")
+print("Число на стрелке     — коэффициент зависимости (0..1):")
+print("                         > 0.9 = сильная связь")
+print("                         0.5-0.9 = средняя")
+print("                         < 0.5 = шум, можно игнорировать")
+print("Число под активностью — сколько раз она встречалась")
+print("=" * 70)
+
+
+# --- 4. Считаем статистику из лога (универсально, без зависимости от версии) ---
+activity_counter = Counter()        # частота активностей
+transition_counter = Counter()      # частота переходов A -> B
+outgoing_counter = Counter()        # сколько раз A был источником перехода
+
+for trace in log:
+    events = sorted(trace, key=lambda e: e['time:timestamp'])
+    for event in events:
+        activity_counter[event['concept:name']] += 1
+
+    for i in range(len(events) - 1):
+        a = events[i]['concept:name']
+        b = events[i + 1]['concept:name']
+        transition_counter[(a, b)] += 1
+        outgoing_counter[a] += 1
+
+
+# --- 5. Активности ---
+total_events = sum(activity_counter.values())
+print(f"\nАктивности в сети ({len(activity_counter)}):")
+print(f"{'Активность':<45} {'Частота':>8} {'Доля':>8}")
+print("-" * 64)
+for name, freq in sorted(activity_counter.items(), key=lambda x: -x[1]):
+    share = freq / total_events * 100 if total_events else 0
+    short = name if len(name) <= 43 else name[:40] + '...'
+    print(f"{short:<45} {freq:>8} {share:>7.1f}%")
+
+
+# --- 6. Топ зависимостей с коэффициентом ---
+# Коэффициент = P(B | A) = сколько раз A -> B / сколько раз A был источником.
+print(f"\nТоп-15 зависимостей (по коэффициенту P(B|A)):")
+print(f"{'Откуда -> Куда':<60} {'Коэф.':>8} {'Раз':>6}")
+print("-" * 78)
+
+deps = []
+for (a, b), cnt in transition_counter.items():
+    denom = outgoing_counter.get(a, 0)
+    if denom == 0:
+        continue
+    coef = cnt / denom
+    deps.append((a, b, coef, cnt))
+
+for a, b, coef, cnt in sorted(deps, key=lambda x: -x[2])[:15]:
+    pair = f"{a} -> {b}"
+    short = pair if len(pair) <= 58 else pair[:55] + '...'
+    print(f"{short:<60} {coef:>8.2f} {cnt:>6}")
+
+
+# --- 7. Показываем картинку ---
+display(Image(filename=OUT_PNG))
+
+# ============================================================
+# ЯЧЕЙКА 7: Conformance check vs эталонной BPMN
+# ============================================================
+
+REF_BPMN_PATH = 'process.bpmn'
+
+
+# ---------- 0. Чистим имена в логе ----------
+# В ячейке 3 мы кладём обогащённую подпись в custom:label, но
+# concept:name могли случайно перезаписать. Здесь подстраховываемся:
+# берём первую строку до \n и убираем префикс "Задача: ".
+def _clean(name):
+    return name.split('\n')[0].replace('Задача: ', '').strip()
+
+
+log_clean = deepcopy(log)
+for trace in log_clean:
+    for event in trace:
+        event['concept:name'] = _clean(event['concept:name'])
+
+print("Пример имён до/после чистки:")
+print(f"  до:    {log[0][0]['concept:name']!r}")
+print(f"  после: {log_clean[0][0]['concept:name']!r}")
+
+
+# ---------- 1. Загрузка эталонной BPMN ----------
+print("\n" + "=" * 70)
+print(f"Conformance check vs эталонной BPMN — {CASE}")
+print("=" * 70)
+print(f"Эталонный файл: {REF_BPMN_PATH}")
+print("Метрики:")
+print("  Fitness   — доля поведения из лога, допустимая моделью (1.0 = идеал)")
+print("  Precision — насколько модель перегружена ветками (1.0 = идеал)")
+print("=" * 70)
+
+reference_bpmn = pm4py.read_bpmn(REF_BPMN_PATH)
+
+# Сохраняем и показываем эталонную BPMN
+REF_PNG = f'{CASE}_reference_bpmn.png'
+try:
+    pm4py.save_vis_bpmn(reference_bpmn, REF_PNG)
+    display(Image(filename=REF_PNG))
+except Exception as e:
+    print(f"save_vis_bpmn для эталона упал: {type(e).__name__}: {e}")
+    pm4py.view_bpmn(reference_bpmn)
+
+
+# ---------- 2. BPMN -> сеть Петри ----------
+net_ref, im_ref, fm_ref = bpmn_converter.apply(reference_bpmn)
+
+
+# ---------- 3. Conformance ----------
+replayed_ref = token_replay.apply(log_clean, net_ref, im_ref, fm_ref)
+
+fitness_ref = fitness_evaluator.apply(
+    log_clean, net_ref, im_ref, fm_ref,
+    variant=fitness_evaluator.Variants.TOKEN_BASED
+)
+precision_ref = precision_evaluator.apply(
+    log_clean, net_ref, im_ref, fm_ref,
+    variant=precision_evaluator.Variants.ETCONFORMANCE_TOKEN
+)
+
+log_fit = fitness_ref.get('log_fitness', fitness_ref.get('logFitness', float('nan')))
+avg_fit = fitness_ref.get('average_trace_fitness',
+                          fitness_ref.get('averageTraceFitness', float('nan')))
+
+print("\n" + "=" * 70)
+print("РЕЗУЛЬТАТЫ CONFORMANCE")
+print("=" * 70)
+print(f"Fitness (log-level):      {log_fit:.3f}")
+print(f"Fitness (avg по трейсам): {avg_fit:.3f}")
+print(f"Precision:                {precision_ref:.3f}")
+
+# Интерпретация
+if log_fit >= 0.9:
+    fit_verdict = "отличное соответствие регламенту"
+elif log_fit >= 0.7:
+    fit_verdict = "умеренные отклонения — есть что улучшать"
+elif log_fit > 0:
+    fit_verdict = "существенные отклонения — процесс сильно отличается от регламента"
+else:
+    fit_verdict = "полное расхождение — модель и лог не пересекаются по именам"
+
+print(f"\nИнтерпретация fitness: {fit_verdict}")
+print(f"  Fitness < 1.0  — в логе есть поведение, не предусмотренное регламентом")
+print(f"  Precision < 1.0 — в регламенте есть ветки, которых не было в логе")
+
+
+# ---------- 4. Если fitness == 0 — диагностика ----------
+if log_fit == 0:
+    print("\n" + "-" * 70)
+    print("ДИАГНОСТИКА: fitness = 0, имена не совпадают")
+    print("-" * 70)
+    log_acts = {e['concept:name'] for t in log_clean for e in t}
+    bpmn_acts = {t.name for t in net_ref.transitions if t.label}
+
+    only_in_log = sorted(log_acts - bpmn_acts)
+    only_in_bpmn = sorted(bpmn_acts - log_acts)
+
+    print(f"\nАктивности только в логе ({len(only_in_log)}):")
+    for a in only_in_log[:15]:
+        print(f"  - {a!r}")
+
+    print(f"\nАктивности только в BPMN ({len(only_in_bpmn)}):")
+    for a in only_in_bpmn[:15]:
+        print(f"  + {a!r}")
+
+    print("\nЧто делать:")
+    print("  1. Проверить имена в process.bpmn — они должны совпадать")
+    print("     с логом символ в символ (включая регистр и пробелы).")
+    print("  2. Если BPMN сгенерирована из того же XES_CONFIG —")
+    print("     убедиться, что генератор BPMN берёт имена из тех же полей.")
+
+
+# ---------- 5. Топ-10 худших трейсов ----------
+# В разных версиях pm4py missing_tokens может быть list или int.
+# Универсальный счётчик:
+def _count(v):
+    return len(v) if isinstance(v, (list, tuple)) else int(v)
+
+
+bad_traces = []
+for i, (trace, r) in enumerate(zip(log_clean, replayed_ref)):
+    if not r.get('trace_is_fit', True):
+        bad_traces.append({
+            'trace_idx': i,
+            'trace_id':  trace.attributes.get('concept:name', f'trace-{i}'),
+            'missing':   _count(r.get('missing_tokens', 0)),
+            'remaining': _count(r.get('remaining_tokens', 0)),
+            'consumed':  _count(r.get('consumed_tokens', 0)),
+        })
+
+print("\n" + "=" * 70)
+print("ТРЕЙСЫ С ОТКЛОНЕНИЯМИ ОТ РЕГЛАМЕНТА")
+print("=" * 70)
+
+if bad_traces:
+    bad_df = (pd.DataFrame(bad_traces)
+              .sort_values('missing', ascending=False)
+              .reset_index(drop=True))
+    n_bad = len(bad_df)
+    n_total = len(log_clean)
+    print(f"Трейсов с отклонениями: {n_bad} из {n_total} "
+          f"({n_bad / n_total * 100:.1f}%)")
+    print(f"\nКолонки:")
+    print(f"  missing   — шагов, которые модель ЖДАЛА, но их не было")
+    print(f"  remaining — шагов, которые БЫЛИ в логе, но модель их не знает")
+    print(f"  consumed  — шагов, которые удалось корректно воспроизвести")
+    print(f"\nТоп-10 худших трейсов (по числу недостающих шагов):")
+    print(bad_df.head(10).to_string(index=False))
+else:
+    print(f"Все {len(log_clean)} трейсов полностью соответствуют эталонной BPMN.")
+    print("Это означает: реальный процесс ни разу не отклонился от регламента.")
+
+# ============================================================
+# ЯЧЕЙКА 8: Bottleneck analysis — где процесс застревает
+# ============================================================
+
+# ---------- 1. Считаем времена ожидания ----------
+wait_times = defaultdict(list)
+
+for trace in log:
+    events = sorted(trace, key=lambda e: e['time:timestamp'])
+    for i in range(len(events) - 1):
+        cur = events[i]
+        nxt = events[i + 1]
+        # Окончание текущего события; если нет — берём его старт
+        cur_end = cur.get('timestamp:end', cur['time:timestamp'])
+        # Ожидание = старт следующего минус окончание текущего
+        wait = (nxt['time:timestamp'] - cur_end).total_seconds() / 60
+        if wait < 0:
+            wait = 0  # защита от артефактов синхронизации
+        pair = (cur['concept:name'], nxt['concept:name'])
+        wait_times[pair].append(wait)
+
+
+# ---------- 2. Сводная таблица ----------
+bottlenecks = []
+for pair, waits in wait_times.items():
+    if len(waits) < 2:
+        continue  # пары с 1 наблюдением статистически бесполезны
+    bottlenecks.append({
+        'from':            pair[0],
+        'to':              pair[1],
+        'mean_wait_min':   round(float(np.mean(waits)), 1),
+        'median_wait_min': round(float(np.median(waits)), 1),
+        'p95_wait_min':    round(float(np.percentile(waits, 95)), 1),
+        'n':               len(waits),
+    })
+
+bottleneck_df = (pd.DataFrame(bottlenecks)
+                 .sort_values('mean_wait_min', ascending=False)
+                 .reset_index(drop=True))
+
+
+# ---------- 3. Заголовок и легенда ----------
+print("=" * 78)
+print(f"УЗКИЕ ГОРЛЫШКИ ПРОЦЕССА — {CASE}")
+print("=" * 78)
+print("Что считается: чистое время ожидания между окончанием одной")
+print("активности и началом следующей (не включая сами активности).")
+print("")
+print("Колонки:")
+print("  mean_wait_min    — среднее ожидание (мин); главный показатель")
+print("  median_wait_min  — медиана; устойчива к выбросам")
+print("  p95_wait_min     — 95-й процентиль; 'худший реалистичный' случай")
+print("  n                — сколько раз такая пара встретилась")
+print("=" * 78)
+
+
+# ---------- 4. Топ-10 в текстовом виде ----------
+top10 = bottleneck_df.head(10).copy()
+top10['from'] = top10['from'].apply(lambda s: s if len(s) <= 35 else s[:32] + '...')
+top10['to']   = top10['to'].apply(lambda s: s if len(s) <= 35 else s[:32] + '...')
+
+print(f"\nТоп-10 переходов по среднему ожиданию "
+      f"(из {len(bottleneck_df)} пар):\n")
+print(top10.to_string(index=False))
+
+
+# ---------- 5. График с подписями ----------
+top = bottleneck_df.head(10).iloc[::-1]  # переворачиваем для barh
+
+fig, ax = plt.subplots(figsize=(13, 6))
+labels = [f"{r['from'][:28]} -> {r['to'][:28]}" for _, r in top.iterrows()]
+bars = ax.barh(labels, top['mean_wait_min'],
+               color='coral', edgecolor='black', alpha=0.85)
+
+# Подписи значений на столбцах
+for bar, v in zip(bars, top['mean_wait_min']):
+    ax.text(v + 0.3, bar.get_y() + bar.get_height() / 2,
+            f'{v:.1f} мин', va='center', fontsize=9)
+
+ax.set_xlabel('Среднее время ожидания между активностями, минуты')
+ax.set_ylabel('Переход: откуда -> куда')
+ax.set_title(f'Топ-10 узких горлышек процесса — {CASE}',
+             fontsize=12, loc='left')
+ax.grid(alpha=0.3, axis='x')
+
+# Подпись «как читать» под графиком
+fig.text(
+    0.01, -0.06,
+    'Как читать: чем длиннее столбец, тем больше времени заказ проводит '
+    'в ожидании на этом переходе.\nЕсли mean >> median (см. таблицу) — '
+    'есть выбросы; смотрите p95.',
+    fontsize=9, color='gray'
+)
+
+plt.tight_layout()
+
+# Сохраняем в PNG
+OUT_PNG = f'{CASE}_bottlenecks.png'
+plt.savefig(OUT_PNG, bbox_inches='tight', dpi=120)
+plt.close()
+
+display(Image(filename=OUT_PNG))
+
+
+# ---------- 6. Интерпретация ----------
+print("\n" + "=" * 78)
+print("ИНТЕРПРЕТАЦИЯ")
+print("=" * 78)
+
+for i, row in top10.head(3).iterrows():
+    ratio = row['mean_wait_min'] / max(row['median_wait_min'], 0.1)
+    tag = "ВЫБРОСЫ" if ratio > 3 else "СТАБИЛЬНО"
+    print(f"\n{i+1}. {row['from']} -> {row['to']}")
+    print(f"   Среднее: {row['mean_wait_min']} мин | "
+          f"медиана: {row['median_wait_min']} мин | "
+          f"P95: {row['p95_wait_min']} мин | "
+          f"n={row['n']}")
+    if ratio > 3:
+        print(f"   Диагноз: {tag}. Большинство проходит быстро, но есть "
+              f"заказы-долгожители (см. P95).")
+    else:
+        print(f"   Диагноз: {tag}. Ожидание предсказуемое, "
+              f"стабильно высокое — кандидат на оптимизацию.")
+
+# ============================================================
+# ЯЧЕЙКА 9: Social network — кто кому передаёт работу
+# ============================================================
+
+
+# ---------- 1. Считаем передачи ----------
+handovers = Counter()
+
+for trace in log:
+    events = sorted(trace, key=lambda e: e['time:timestamp'])
+    for i in range(len(events) - 1):
+        r1 = events[i].get('org:resource', 'unknown')
+        r2 = events[i + 1].get('org:resource', 'unknown')
+        if r1 != r2:
+            handovers[(r1, r2)] += 1
+
+
+# ---------- 2. Заголовок и легенда ----------
+print("=" * 78)
+print(f"СОЦИАЛЬНАЯ СЕТЬ ПРОЦЕССА — {CASE}")
+print("=" * 78)
+print("Что считается: пара последовательных событий, у которых")
+print("исполнитель (org:resource) сменился — это одна передача работы.")
+print("")
+print("Матрица ниже:")
+print("  строки   — кто передаёт (источник)")
+print("  столбцы  — кому передают (получатель)")
+print("  число    — сколько раз такая передача встретилась")
+print("  тёмная клетка = частая передача")
+print("=" * 78)
+
+
+# ---------- 3. Топ-10 в текстовом виде ----------
+total_handovers = sum(handovers.values())
+unique_pairs = len(handovers)
+
+print(f"\nВсего передач: {total_handovers}")
+print(f"Уникальных пар 'откуда -> куда': {unique_pairs}")
+
+print(f"\nТоп-10 передач:")
+print(f"{'Откуда -> Кому':<55} {'Раз':>6} {'Доля':>8}")
+print("-" * 71)
+for (r1, r2), c in handovers.most_common(10):
+    share = c / total_handovers * 100 if total_handovers else 0
+    pair = f"{r1} -> {r2}"
+    short = pair if len(pair) <= 53 else pair[:50] + '...'
+    print(f"{short:<55} {c:>6} {share:>7.1f}%")
+
+
+# ---------- 4. Тепловая карта ----------
+# Берём топ-15 ресурсов по суммарному участию в передачах
+resource_freq = Counter()
+for (r1, r2), c in handovers.items():
+    resource_freq[r1] += c
+    resource_freq[r2] += c
+
+top_resources = [r for r, _ in resource_freq.most_common(15)]
+
+matrix = pd.DataFrame(0, index=top_resources, columns=top_resources, dtype=int)
+for (r1, r2), c in handovers.items():
+    if r1 in matrix.index and r2 in matrix.columns:
+        matrix.loc[r1, r2] = c
+
+fig, ax = plt.subplots(figsize=(13, 10))
+sns.heatmap(
+    matrix, annot=True, fmt='d', cmap='YlOrRd', ax=ax,
+    cbar_kws={'label': 'Количество передач'},
+    linewidths=0.5, linecolor='gray',
+    annot_kws={'size': 9}
+)
+ax.set_title(
+    f'Матрица передач работы между ресурсами — {CASE}\n'
+    f'Топ-15 ресурсов по вовлечённости, всего передач: {total_handovers}',
+    fontsize=12, loc='left'
+)
+ax.set_xlabel('Кому передают (получатель)')
+ax.set_ylabel('Кто передаёт (источник)')
+
+# Подпись «как читать» под графиком
+fig.text(
+    0.01, -0.03,
+    'Как читать: строка = источник, столбец = получатель. '
+    'Число в клетке = сколько раз такая передача была.\n'
+    'Тёмная клетка = частая передача. Пустая клетка = передачи не было.',
+    fontsize=9, color='gray'
+)
+
+plt.tight_layout()
+OUT_PNG = f'{CASE}_handovers.png'
+plt.savefig(OUT_PNG, bbox_inches='tight', dpi=120)
+plt.close()
+
+display(Image(filename=OUT_PNG))
+
+
+# ---------- 5. Интерпретация ----------
+print("\n" + "=" * 78)
+print("ИНТЕРПРЕТАЦИЯ")
+print("=" * 78)
+
+# Кто больше всех передаёт
+outgoing = Counter()
+incoming = Counter()
+for (r1, r2), c in handovers.items():
+    outgoing[r1] += c
+    incoming[r2] += c
+
+print("\nТоп-5 ресурсов по исходящим передачам (много передают):")
+for r, c in outgoing.most_common(5):
+    share = c / total_handovers * 100 if total_handovers else 0
+    print(f"  {r:<30} {c:>6} ({share:.1f}%)")
+
+print("\nТоп-5 ресурсов по входящим передачам (много получают):")
+for r, c in incoming.most_common(5):
+    share = c / total_handovers * 100 if total_handovers else 0
+    print(f"  {r:<30} {c:>6} ({share:.1f}%)")
+
+# Пинг-понг: A->B и B->A в сумме
+print("\nПинг-понг между ресурсами (A -> B + B -> A):")
+seen = set()
+ping_pong = []
+for (r1, r2), c1 in handovers.items():
+    if (r2, r1) in handovers and (r2, r1) not in seen:
+        seen.add((r1, r2))
+        c2 = handovers[(r2, r1)]
+        ping_pong.append((r1, r2, c1 + c2))
+
+if ping_pong:
+    for r1, r2, c in sorted(ping_pong, key=lambda x: -x[2])[:5]:
+        print(f"  {r1} <-> {r2}: {c} передач в обе стороны")
+else:
+    print("  Пинг-понга не обнаружено — каждая передача однонаправленная.")
+
+# ============================================================
+# ЯЧЕЙКА 10: Варианты процесса + throughput + метрики вариантов
+# ============================================================
+
+def _clean_name(name: str) -> str:
+    """Срезает префикс 'Задача: ' и всё после первого перевода строки."""
+    return name.split('\n')[0].replace('Задача: ', '').strip()
+
+
+# ---------- 1. Считаем варианты ----------
+# ВАЖНО: variants_get.get_variants(log) возвращает
+#   {List[str]: List[Trace]} — значение это СПИСОК трейсов, а не число.
+variants = variants_get.get_variants(log)
+total_traces = len(log)
+
+print("=" * 78)
+print(f"ВАРИАНТЫ ПРОЦЕССА — {CASE}")
+print("=" * 78)
+print("Вариант = уникальная последовательность активностей в трейсе.")
+print("Обычно 80% трейсов укладываются в 3–5 основных вариантов.")
+print("=" * 78)
+print(f"\nВсего трейсов в логе:      {total_traces}")
+print(f"Всего вариантов процесса:  {len(variants)}")
+
+
+# ---------- 2. Топ-5 вариантов с чистыми именами ----------
+top_variants = sorted(variants.items(), key=lambda x: len(x[1]), reverse=True)[:5]
+
+print("\n" + "-" * 78)
+print("ТОП-5 САМЫХ ЧАСТЫХ ВАРИАНТОВ")
+print("-" * 78)
+for i, (variant, traces) in enumerate(top_variants, 1):
+    n = len(traces)
+    share = n / total_traces * 100 if total_traces else 0
+    print(f"\nВариант {i}: {n} трейсов ({share:.1f}%), {len(variant)} шагов")
+    for step, act in enumerate(variant, 1):
+        short = _clean_name(act)
+        print(f"  {step:2d}. {short}")
+
+
+# ---------- 3. Длительность кейсов ----------
+case_durations = []
+for trace in log:
+    events = sorted(trace, key=lambda e: e['time:timestamp'])
+    if len(events) >= 2:
+        dur = (events[-1]['time:timestamp']
+               - events[0]['time:timestamp']).total_seconds() / 3600
+        case_durations.append(dur)
+
+print("\n" + "=" * 78)
+print("ДЛИТЕЛЬНОСТЬ КЕЙСОВ (часы)")
+print("=" * 78)
+print("Длительность = от первого события трейса до последнего.")
+print("Среднее чувствительно к выбросам; медиана — 'типичный' кейс;")
+print("P95 — 'худший реалистичный' случай.\n")
+
+if case_durations:
+    mean_d = np.mean(case_durations)
+    median_d = np.median(case_durations)
+    p95_d = np.percentile(case_durations, 95)
+    max_d = np.max(case_durations)
+
+    print(f"Кейсов с 2+ событиями:  {len(case_durations)}")
+    print(f"Среднее:                {mean_d:>8.1f} ч")
+    print(f"Медиана:                {median_d:>8.1f} ч")
+    print(f"P95:                    {p95_d:>8.1f} ч")
+    print(f"Максимум:               {max_d:>8.1f} ч")
+
+    if mean_d > median_d * 1.5:
+        print("\n  Mean >> Median: есть выбросы (долгие кейсы).")
+        print("  Смотрите P95 и хвост — там rework / loopback.")
+    elif mean_d < median_d * 0.9:
+        print("\n  Mean < Median: левостороннее распределение —")
+        print("  большинство кейсов длинные, но есть быстрые выбросы.")
+    else:
+        print("\n  Mean ≈ Median: распределение симметричное,")
+        print("  процесс стабилен.")
+else:
+    print("Нет трейсов с 2+ событиями — нечего считать.")
+
+
+# ---------- 4. Сводная таблица топ-10 вариантов ----------
+rows = []
+for variant, traces in variants.items():
+    durs = []
+    for t in traces:
+        evs = sorted(t, key=lambda e: e['time:timestamp'])
+        if len(evs) >= 2:
+            durs.append(
+                (evs[-1]['time:timestamp'] - evs[0]['time:timestamp'])
+                .total_seconds() / 3600
+            )
+
+    rows.append({
+        'steps':           len(variant),
+        'n_traces':        len(traces),
+        'share_%':         round(len(traces) / total_traces * 100, 1) if total_traces else 0,
+        'avg_duration_h':  round(np.mean(durs), 1) if durs else None,
+        'first_step':      _clean_name(variant[0]) if variant else '',
+        'last_step':       _clean_name(variant[-1]) if variant else '',
+    })
+
+variants_df = (
+    pd.DataFrame(rows)
+    .sort_values('n_traces', ascending=False)
+    .reset_index(drop=True)
+)
+
+print("\n" + "=" * 78)
+print("ТОП-10 ВАРИАНТОВ ПРОЦЕССА (сводная таблица)")
+print("=" * 78)
+print("Колонки:")
+print("  steps          — число шагов в варианте")
+print("  n_traces       — сколько трейсов реализуют этот вариант")
+print("  share_%        — доля от всех трейсов")
+print("  avg_duration_h — средняя длительность варианта, часы")
+print("  first_step     — с чего начинается вариант")
+print("  last_step      — чем заканчивается\n")
+
+with pd.option_context('display.max_colwidth', 45, 'display.width', 200):
+    print(variants_df.head(10).to_string(index=False))
+
+
+# ---------- 5. Проверка «эффекта подписей» ----------
+# Если concept:name содержит подписи с длительностью (из ячейки 3),
+# число «сырых» вариантов будет в разы больше чистых.
+clean_variants = set()
+for trace in log:
+    seq = tuple(_clean_name(e['concept:name']) for e in trace)
+    clean_variants.add(seq)
