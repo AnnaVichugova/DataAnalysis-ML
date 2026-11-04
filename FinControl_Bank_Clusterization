@@ -1,0 +1,983 @@
+# Скрипт для запуска в Google Colab (в локальной IDE убрать !)
+
+# ============================================================================
+# 1. Установка и импорт библиотек
+# ============================================================================
+!pip install scikit-learn pandas numpy matplotlib seaborn plotly
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.metrics import (silhouette_score, calinski_harabasz_score,
+                             davies_bouldin_score, adjusted_rand_score)
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.utils import resample
+from scipy.cluster.hierarchy import dendrogram, linkage
+from collections import defaultdict
+
+# ============================================================================
+# 2. Генерация датасета ЦФО банка
+# ============================================================================
+np.random.seed(42)
+
+def generate_cfo_dataset(n_samples=300):
+    cfo_types = ['Розничный бизнес', 'Корпоративный бизнес', 'ИТ', 'Бэк-офис',
+                 'HR', 'Маркетинг', 'Риски', 'Проектный офис', 'Юридический', 'Финансовый']
+    divisions = ['Москва', 'Санкт-Петербург', 'Регионы', 'Центральный аппарат']
+
+    data = {
+        'cfo_id': [f'CFO_{i:04d}' for i in range(n_samples)],
+        'cfo_type': np.random.choice(cfo_types, n_samples),
+        'division': np.random.choice(divisions, n_samples),
+        'annual_revenue': np.random.uniform(0, 5_000_000_000, n_samples).round(0),
+        'direct_expenses': np.random.uniform(50_000_000, 2_000_000_000, n_samples).round(0),
+        'indirect_expenses': np.random.uniform(10_000_000, 500_000_000, n_samples).round(0),
+        'fte_count': np.random.randint(3, 800, n_samples),
+        'budget_utilization_rate': np.random.uniform(0.3, 1.15, n_samples).round(3),
+        'capex_rate': np.random.uniform(0, 1.0, n_samples).round(3),
+        'prev_revenue': np.random.uniform(0, 4_500_000_000, n_samples).round(0),
+        'prev_expenses': np.random.uniform(50_000_000, 2_000_000_000, n_samples).round(0),
+    }
+
+    df = pd.DataFrame(data)
+
+    idx1 = np.random.choice(n_samples, size=int(n_samples * 0.20), replace=False)
+    df.loc[idx1, 'annual_revenue'] = np.random.uniform(1_500_000_000, 5_000_000_000, len(idx1))
+    df.loc[idx1, 'direct_expenses'] = df.loc[idx1, 'annual_revenue'] * np.random.uniform(0.25, 0.45, len(idx1))
+    df.loc[idx1, 'fte_count'] = np.random.randint(100, 800, len(idx1))
+    df.loc[idx1, 'budget_utilization_rate'] = np.random.uniform(0.7, 0.98, len(idx1))
+
+    idx2 = np.random.choice(n_samples, size=int(n_samples * 0.30), replace=False)
+    df.loc[idx2, 'annual_revenue'] = 0
+    df.loc[idx2, 'direct_expenses'] = np.random.uniform(150_000_000, 700_000_000, len(idx2))
+    df.loc[idx2, 'indirect_expenses'] = np.random.uniform(80_000_000, 300_000_000, len(idx2))
+    df.loc[idx2, 'fte_count'] = np.random.randint(20, 200, len(idx2))
+    df.loc[idx2, 'budget_utilization_rate'] = np.random.uniform(0.85, 1.0, len(idx2))
+    df.loc[idx2, 'capex_rate'] = np.random.uniform(0, 0.1, len(idx2))
+
+    idx3 = np.random.choice(n_samples, size=int(n_samples * 0.20), replace=False)
+    df.loc[idx3, 'annual_revenue'] = np.random.uniform(0, 100_000_000, len(idx3))
+    df.loc[idx3, 'direct_expenses'] = np.random.uniform(200_000_000, 1_000_000_000, len(idx3))
+    df.loc[idx3, 'capex_rate'] = np.random.uniform(0.55, 1.0, len(idx3))
+    df.loc[idx3, 'budget_utilization_rate'] = np.random.uniform(0.4, 0.85, len(idx3))
+    df.loc[idx3, 'fte_count'] = np.random.randint(10, 150, len(idx3))
+
+    idx4 = np.random.choice(n_samples, size=int(n_samples * 0.30), replace=False)
+    df.loc[idx4, 'annual_revenue'] = np.random.uniform(100_000_000, 800_000_000, len(idx4))
+    df.loc[idx4, 'direct_expenses'] = df.loc[idx4, 'annual_revenue'] * np.random.uniform(0.85, 1.15, len(idx4))
+    df.loc[idx4, 'indirect_expenses'] = np.random.uniform(100_000_000, 400_000_000, len(idx4))
+    df.loc[idx4, 'budget_utilization_rate'] = np.random.uniform(1.0, 1.15, len(idx4))
+    df.loc[idx4, 'fte_count'] = np.random.randint(30, 300, len(idx4))
+    df.loc[idx4, 'prev_expenses'] = df.loc[idx4, 'direct_expenses'] * np.random.uniform(0.5, 0.85, len(idx4))
+    df.loc[idx4, 'prev_revenue'] = df.loc[idx4, 'annual_revenue'] * np.random.uniform(0.9, 1.1, len(idx4))
+
+    return df
+
+
+df = generate_cfo_dataset(300)
+
+# Русские названия колонок для вывода в консоль
+columns_ru = {
+    'cfo_id': 'Идентификатор ЦФО (cfo_id)',
+    'cfo_type': 'Тип ЦФО (cfo_type)',
+    'division': 'Подразделение (division)',
+    'annual_revenue': 'Доходы ЦФО, руб. (annual_revenue)',
+    'direct_expenses': 'Прямые расходы, руб. (direct_expenses)',
+    'indirect_expenses': 'Косвенные (аллоцированные) расходы, руб. (indirect_expenses)',
+    'fte_count': 'Численность персонала, FTE (fte_count)',
+    'budget_utilization_rate': 'Освоение бюджета (budget_utilization_rate)',
+    'capex_rate': 'Темп освоения капитальных затрат, CAPEX (capex_rate)',
+    'prev_revenue': 'Доходы предыдущего периода, руб. (prev_revenue)',
+    'prev_expenses': 'Расходы предыдущего периода, руб. (prev_expenses)',
+    'cir': 'Отношение расходов к доходам, CIR (cir)',
+    'revenue_per_fte': 'Доход на одного сотрудника, FTE (revenue_per_fte)',
+    'admin_share': 'Доля административных расходов (admin_share)',
+    'expense_growth': 'Рост расходов (expense_growth)',
+    'revenue_growth': 'Рост доходов (revenue_growth)',
+    'expense_outpacing': 'Опережение роста расходов над доходами (expense_outpacing)',
+    'expense_per_fte': 'Расходы на одного сотрудника, FTE (expense_per_fte)',
+    'budget_deviation': 'Отклонение от лимита (budget_deviation)',
+    'total_expenses': 'Суммарные расходы, руб. (total_expenses)',
+    'cfo_type_encoded': 'Тип ЦФО, код (cfo_type_encoded)',
+    'division_encoded': 'Подразделение, код (division_encoded)',
+    'cluster': 'Кластер (cluster)',
+    'cluster_type': 'Тип кластера (cluster_type)',
+    'risk_score': 'Оценка риска (risk_score)',
+}
+
+print(f"Сгенерировано {len(df)} ЦФО")
+print("\nПервые 5 записей:")
+print(df.head().rename(columns=columns_ru))
+
+# ============================================================================
+# 3. Расчёт синтетических признаков
+# ============================================================================
+df['cir'] = (df['direct_expenses'] + df['indirect_expenses']) / (df['annual_revenue'] + 1)
+df['revenue_per_fte'] = df['annual_revenue'] / (df['fte_count'] + 1)
+df['admin_share'] = df['indirect_expenses'] / (df['direct_expenses'] + df['indirect_expenses'] + 1)
+df['expense_growth'] = (df['direct_expenses'] - df['prev_expenses']) / (df['prev_expenses'] + 1)
+df['revenue_growth'] = (df['annual_revenue'] - df['prev_revenue']) / (df['prev_revenue'] + 1)
+df['expense_outpacing'] = df['expense_growth'] - df['revenue_growth']
+df['expense_per_fte'] = (df['direct_expenses'] + df['indirect_expenses']) / (df['fte_count'] + 1)
+df['budget_deviation'] = df['budget_utilization_rate'] - 1.0
+df['total_expenses'] = df['direct_expenses'] + df['indirect_expenses']
+
+print("\nСинтетические признаки рассчитаны:")
+print("  CIR (cir) — отношение расходов к доходам")
+print("  Доход на 1 сотрудника (revenue_per_fte)")
+print("  Доля административных расходов (admin_share)")
+print("  Рост расходов (expense_growth)")
+print("  Опережение роста расходов над доходами (expense_outpacing)")
+print("  Отклонение от лимита (budget_deviation)")
+print()
+print(df[['cir', 'revenue_per_fte', 'admin_share', 'expense_growth',
+          'expense_outpacing', 'budget_deviation']]
+      .describe().round(3)
+      .rename(columns=columns_ru))
+
+# ============================================================================
+# 4. Предобработка данных для кластеризации
+# ============================================================================
+le_type = LabelEncoder()
+le_division = LabelEncoder()
+df['cfo_type_encoded'] = le_type.fit_transform(df['cfo_type'])
+df['division_encoded'] = le_division.fit_transform(df['division'])
+
+features_for_clustering = [
+    'annual_revenue', 'direct_expenses', 'indirect_expenses',
+    'fte_count', 'budget_utilization_rate', 'capex_rate',
+    'cir', 'revenue_per_fte', 'admin_share',
+    'expense_growth', 'revenue_growth', 'expense_outpacing',
+    'expense_per_fte', 'budget_deviation',
+    'cfo_type_encoded', 'division_encoded'
+]
+
+X = df[features_for_clustering].copy()
+
+for col in ['annual_revenue', 'direct_expenses', 'indirect_expenses',
+            'revenue_per_fte', 'expense_per_fte']:
+    X[f'{col}_log'] = np.log1p(np.clip(X[col], 0, None))
+
+X['cir'] = X['cir'].replace([np.inf, -np.inf], np.nan).fillna(X['cir'].median())
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+X_scaled_df = pd.DataFrame(X_scaled, columns=X.columns)
+
+print(f"\nРазмерность подготовленных данных: {X_scaled_df.shape[0]} строк, "
+      f"{X_scaled_df.shape[1]} признаков")
+
+# ============================================================================
+# 5. Поиск оптимального числа кластеров
+# ============================================================================
+inertias, sil_scores, ch_scores, db_scores = [], [], [], []
+K_range = range(2, 9)
+
+for k in K_range:
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = km.fit_predict(X_scaled_df)
+    inertias.append(km.inertia_)
+    sil_scores.append(silhouette_score(X_scaled_df, labels))
+    ch_scores.append(calinski_harabasz_score(X_scaled_df, labels))
+    db_scores.append(davies_bouldin_score(X_scaled_df, labels))
+
+N_CLUSTERS = 4
+print(f"Целевое число кластеров (по бизнес-требованию): {N_CLUSTERS}")
+
+fig, axes = plt.subplots(2, 2, figsize=(15, 11))
+fig.suptitle('Выбор числа кластеров\n'
+             'Красная линия — k=4 (бизнес-требование: 4 типа ЦФО)',
+             fontsize=15)
+
+ax = axes[0, 0]
+ax.plot(K_range, inertias, 'bo-')
+ax.axvline(N_CLUSTERS, color='red', linestyle='--', alpha=0.7, label='k=4')
+ax.set_title('Метод локтя (Elbow): суммарный разброс внутри кластеров\n'
+             'Явного "локтя" нет — кривая плавная')
+ax.set_xlabel('Число кластеров')
+ax.set_ylabel('Суммарный разброс внутри кластеров (инерция)')
+ax.grid(alpha=0.3)
+ax.legend(loc='upper right')
+ax.text(0.02, 0.05, 'Нет явного перелома —\nориентируемся на другие метрики.',
+        transform=ax.transAxes, fontsize=9, va='bottom',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='#F5F5DC', alpha=0.85))
+
+ax = axes[0, 1]
+ax.plot(K_range, sil_scores, 'ro-')
+ax.axvline(N_CLUSTERS, color='red', linestyle='--', alpha=0.7, label='k=4')
+best_sil_k = list(K_range)[int(np.argmax(sil_scores))]
+ax.scatter([best_sil_k], [max(sil_scores)], s=140, facecolors='none',
+           edgecolors='black', linewidths=1.6, zorder=5,
+           label=f'макс. на k={best_sil_k}')
+ax.set_title('Коэффициент силуэта (Silhouette): выше — лучше\n'
+             'Максимум на k=5..7, не на k=4')
+ax.set_xlabel('Число кластеров')
+ax.set_ylabel('Коэффициент силуэта (0..1)')
+ax.grid(alpha=0.3)
+ax.legend(loc='lower right', fontsize=9)
+for k, v in zip(K_range, sil_scores):
+    ax.annotate(f'{v:.3f}', (k, v), textcoords='offset points',
+                xytext=(0, 8), ha='center', fontsize=8)
+ax.text(0.02, 0.05, 'Дробление на k=5..7\nне даёт нового бизнес-смысла.',
+        transform=ax.transAxes, fontsize=9, va='bottom',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='#FFF0F0', alpha=0.85))
+
+ax = axes[1, 0]
+ax.plot(K_range, ch_scores, 'go-')
+ax.axvline(N_CLUSTERS, color='red', linestyle='--', alpha=0.7, label='k=4')
+best_ch_k = list(K_range)[int(np.argmax(ch_scores))]
+ax.scatter([best_ch_k], [max(ch_scores)], s=140, facecolors='none',
+           edgecolors='black', linewidths=1.6, zorder=5,
+           label=f'макс. на k={best_ch_k}')
+ax.set_title('Индекс Калински-Харабаша (Calinski-Harabasz): выше — лучше\n'
+             'Максимум на k=6; k=4 — конкурентоспособный уровень')
+ax.set_xlabel('Число кластеров')
+ax.set_ylabel('Индекс Калински-Харабаша')
+ax.grid(alpha=0.3)
+ax.legend(loc='lower right', fontsize=9)
+for k, v in zip(K_range, ch_scores):
+    ax.annotate(f'{v:.1f}', (k, v), textcoords='offset points',
+                xytext=(0, 8), ha='center', fontsize=8)
+ax.text(0.02, 0.05, 'Чётче границы — но за счёт\nдробления бизнес-сегментов.',
+        transform=ax.transAxes, fontsize=9, va='bottom',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='#F0FFF0', alpha=0.85))
+
+ax = axes[1, 1]
+ax.plot(K_range, db_scores, 'mo-')
+ax.axvline(N_CLUSTERS, color='red', linestyle='--', alpha=0.7, label='k=4')
+best_db_k = list(K_range)[int(np.argmin(db_scores))]
+ax.scatter([best_db_k], [min(db_scores)], s=140, facecolors='none',
+           edgecolors='black', linewidths=1.6, zorder=5,
+           label=f'мин. на k={best_db_k}')
+ax.set_title('Индекс Дэвиса-Болдина (Davies-Bouldin): ниже — лучше\n'
+             'Минимум на k=5; k=4 — локальный минимум')
+ax.set_xlabel('Число кластеров')
+ax.set_ylabel('Индекс Дэвиса-Болдина')
+ax.grid(alpha=0.3)
+ax.legend(loc='upper right', fontsize=9)
+for k, v in zip(K_range, db_scores):
+    ax.annotate(f'{v:.2f}', (k, v), textcoords='offset points',
+                xytext=(0, 8), ha='center', fontsize=8)
+ax.text(0.02, 0.95, 'При k=4 разбиение уже\nдостаточно компактное.',
+        transform=ax.transAxes, fontsize=9, va='top',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='#FFF0FF', alpha=0.85))
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================================
+# 5b. Обоснование выбора k: устойчивость и интерпретируемость
+# ============================================================================
+def evaluate_k(k_values, X_scaled, X_raw, n_bootstrap=20, sample_frac=0.8):
+    biz_cols = ['cir', 'revenue_per_fte', 'admin_share',
+                'expense_outpacing', 'budget_utilization_rate', 'capex_rate']
+
+    rows = []
+    n = len(X_scaled)
+
+    for k in k_values:
+        km = KMeans(n_clusters=k, random_state=42, n_init=20)
+        labels_full = km.fit_predict(X_scaled)
+
+        sil = silhouette_score(X_scaled, labels_full)
+        ch = calinski_harabasz_score(X_scaled, labels_full)
+        db = davies_bouldin_score(X_scaled, labels_full)
+
+        # Инерция — числовой аналог «метода локтя»:
+        # суммарный квадрат расстояний точек до центров своих кластеров.
+        inertia = float(km.inertia_)
+
+        aris = []
+        for _ in range(n_bootstrap):
+            idx = resample(np.arange(n), replace=False,
+                           n_samples=int(n * sample_frac), random_state=None)
+            km_b = KMeans(n_clusters=k, random_state=42, n_init=10)
+            km_b.fit(X_scaled[idx])
+            labels_pred_full = km_b.predict(X_scaled)
+            aris.append(adjusted_rand_score(labels_full, labels_pred_full))
+        stability = float(np.mean(aris))
+
+        eta_list = []
+        for col in biz_cols:
+            vals = X_raw[col].astype(float)
+            grand_mean = vals.mean()
+            ss_total = ((vals - grand_mean) ** 2).sum()
+            ss_between = 0.0
+            for c in np.unique(labels_full):
+                mask = labels_full == c
+                if mask.sum() == 0:
+                    continue
+                ss_between += mask.sum() * (vals[mask].mean() - grand_mean) ** 2
+            eta = ss_between / ss_total if ss_total > 0 else 0.0
+            eta_list.append(eta)
+        interpretability = float(np.mean(eta_list))
+
+        rows.append({
+            'k': k,
+            'inertia': round(inertia, 2),
+            'silhouette': round(sil, 4),
+            'calinski': round(ch, 2),
+            'davies_bouldin': round(db, 4),
+            'stability_ari': round(stability, 4),
+            'interpretability_eta2': round(interpretability, 4),
+        })
+    return pd.DataFrame(rows)
+
+
+X_raw_for_interp = df[['cir', 'revenue_per_fte', 'admin_share',
+                       'expense_outpacing', 'budget_utilization_rate',
+                       'capex_rate']].copy()
+X_raw_for_interp['cir'] = X_raw_for_interp['cir'].replace(
+    [np.inf, -np.inf], np.nan
+).fillna(X_raw_for_interp['cir'].median())
+
+k_table = evaluate_k(range(2, 9), X_scaled, X_raw_for_interp)
+
+k_table_ru = k_table.rename(columns={
+    'k': 'Число кластеров (k)',
+    'inertia': 'Инерция — суммарный разброс внутри кластеров (inertia)',
+    'silhouette': 'Коэффициент силуэта (silhouette)',
+    'calinski': 'Индекс Калински-Харабаша (calinski)',
+    'davies_bouldin': 'Индекс Дэвиса-Болдина (davies_bouldin)',
+    'stability_ari': 'Устойчивость, ARI (stability_ari)',
+    'interpretability_eta2': 'Интерпретируемость, eta^2 (interpretability_eta2)',
+})
+
+print("\n" + "=" * 100)
+print("СВОДНАЯ ТАБЛИЦА ОБОСНОВАНИЯ ЧИСЛА КЛАСТЕРОВ")
+print("=" * 100)
+print("  inertia               — числовой аналог «метода локтя»: суммарный квадрат расстояний")
+print("                          точек до центров своих кластеров. Чем меньше — тем плотнее кластеры.")
+print("                          «Локоть» — точка, после которой падение инерции резко замедляется.")
+print("  silhouette            — коэффициент силуэта: 1.0 = идеальное разделение, 0 = случайное")
+print("  calinski              — индекс Калински-Харабаша: выше = кластеры плотнее и дальше друг от друга")
+print("  davies_bouldin        — индекс Дэвиса-Болдина: ниже = кластеры компактнее и лучше разделены")
+print("  stability_ari         — устойчивость (скорректированный индекс Рэнда, ARI):")
+print("                          1.0 = разбиение полностью воспроизводится на подвыборках,")
+print("                          0.0 = совпадение случайно")
+print("  interpretability_eta2 — интерпретируемость (eta^2): доля разброса бизнес-метрик,")
+print("                          объяснённая кластерами (0..1)")
+print()
+print(k_table_ru.to_string(index=False))
+
+# Отдельно — падение инерции (числовой «локоть»)
+k_table['inertia_drop'] = k_table['inertia'].diff().abs()
+k_table['inertia_drop_pct'] = (k_table['inertia_drop'] /
+                                k_table['inertia'].shift(1) * 100).round(1)
+
+print("\nПАДЕНИЕ ИНЕРЦИИ ПРИ ПЕРЕХОДЕ ОТ k-1 К k (числовой «локоть»)")
+print("-" * 100)
+print("  inertia_drop      — на сколько уменьшилась инерция при добавлении одного кластера")
+print("  inertia_drop_pct  — то же в процентах от инерции на предыдущем шаге")
+print("  «Локоть» там, где inertia_drop_pct резко замедляется (начинает стагнировать).")
+print()
+print(k_table[['k', 'inertia', 'inertia_drop', 'inertia_drop_pct']]
+      .rename(columns={
+          'k': 'Число кластеров (k)',
+          'inertia': 'Инерция (inertia)',
+          'inertia_drop': 'Падение инерции (inertia_drop)',
+          'inertia_drop_pct': 'Падение, % (inertia_drop_pct)',
+      })
+      .to_string(index=False))
+
+# Автоматическое определение формального «локтя»:
+# берём точку с максимальным относительным падением, но не на первом шаге
+# (первый шаг 2→3 всегда большой и неинформативен)
+valid = k_table.dropna(subset=['inertia_drop_pct']).iloc[1:]
+if len(valid) > 0:
+    elbow_row = valid.loc[valid['inertia_drop_pct'].idxmax()]
+    print(f"\nФормальный «локоть» по максимальному относительному падению инерции: "
+          f"k={int(elbow_row['k'])} (падение {elbow_row['inertia_drop_pct']}%)")
+    print("Если падение плавное и максимум не выделяется — формального локтя нет,")
+    print("и в выборе k ориентируемся на другие метрики (см. таблицу выше).")
+
+
+def norm_positive(s):
+    return (s - s.min()) / (s.max() - s.min() + 1e-12)
+
+
+def norm_negative(s):
+    return (s.max() - s) / (s.max() - s.min() + 1e-12)
+
+
+score = pd.DataFrame({'k': k_table['k']})
+score['sil_n'] = norm_positive(k_table['silhouette'])
+score['ch_n'] = norm_positive(k_table['calinski'])
+score['db_n'] = norm_negative(k_table['davies_bouldin'])
+score['stab_n'] = norm_positive(k_table['stability_ari'])
+score['interp_n'] = norm_positive(k_table['interpretability_eta2'])
+
+w = {'sil_n': 0.15, 'ch_n': 0.10, 'db_n': 0.15,
+     'stab_n': 0.30, 'interp_n': 0.30}
+score['weighted_score'] = sum(score[c] * wc for c, wc in w.items())
+score = score.sort_values('weighted_score', ascending=False).reset_index(drop=True)
+
+score_ru = score[['k', 'sil_n', 'ch_n', 'db_n', 'stab_n', 'interp_n', 'weighted_score']].rename(columns={
+    'k': 'Число кластеров (k)',
+    'sil_n': 'Силуэт, норм. (sil_n)',
+    'ch_n': 'Калински-Харабаш, норм. (ch_n)',
+    'db_n': 'Дэвис-Болдин, норм. (db_n)',
+    'stab_n': 'Устойчивость, норм. (stab_n)',
+    'interp_n': 'Интерпретируемость, норм. (interp_n)',
+    'weighted_score': 'Взвешенный балл (weighted_score)',
+})
+
+print("\n" + "=" * 100)
+print("ВЗВЕШЕННЫЙ БАЛЛ (устойчивость и интерпретируемость имеют повышенный вес)")
+print("=" * 100)
+print("Веса: силуэт — 0.15, Калински-Харабаш — 0.10, Дэвис-Болдин — 0.15,")
+print("      устойчивость — 0.30, интерпретируемость — 0.30")
+print()
+print(score_ru.round(3).to_string(index=False))
+
+fig, axes = plt.subplots(1, 3, figsize=(19, 7))
+fig.suptitle('Обоснование выбора k=4: устойчивость, интерпретируемость, взвешенный балл',
+             fontsize=15)
+
+ax = axes[0]
+ax.plot(k_table['k'], k_table['stability_ari'], 'o-', color='teal')
+ax.axvline(N_CLUSTERS, color='red', linestyle='--', alpha=0.7, label='k=4')
+ax.set_title('Устойчивость кластеров\n'
+             'Выше — результат повторяется на новых данных')
+ax.set_xlabel('Число кластеров')
+ax.set_ylabel('Устойчивость (0..1)')
+ax.grid(alpha=0.3)
+ax.legend(loc='lower right', fontsize=9)
+for k, v in zip(k_table['k'], k_table['stability_ari']):
+    ax.annotate(f'{v:.2f}', (k, v), textcoords='offset points',
+                xytext=(0, 8), ha='center', fontsize=8)
+ax.text(0.02, 0.05,
+        'Многократно берём 80% ЦФО и пересчитываем кластеры.\n'
+        'Совпадение с исходным: 1.0 — полное, 0.0 — случайное.',
+        transform=ax.transAxes, fontsize=9, va='bottom',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='#E0F7FA', alpha=0.9))
+
+ax = axes[1]
+ax.plot(k_table['k'], k_table['interpretability_eta2'], 'o-', color='darkorange')
+ax.axvline(N_CLUSTERS, color='red', linestyle='--', alpha=0.7, label='k=4')
+ax.set_title('Интерпретируемость кластеров\n'
+             'Доля разброса бизнес-метрик, объяснённая кластерами')
+ax.set_xlabel('Число кластеров')
+ax.set_ylabel('Интерпретируемость (0..1)')
+ax.grid(alpha=0.3)
+ax.legend(loc='lower right', fontsize=9)
+for k, v in zip(k_table['k'], k_table['interpretability_eta2']):
+    ax.annotate(f'{v:.2f}', (k, v), textcoords='offset points',
+                xytext=(0, 8), ha='center', fontsize=8)
+ax.text(0.02, 0.05,
+        '0 — кластеры не связаны с бизнес-метриками,\n'
+        '1 — полностью объясняют их различия.',
+        transform=ax.transAxes, fontsize=9, va='bottom',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='#FFE0B2', alpha=0.9))
+
+ax = axes[2]
+bars = ax.bar(score['k'].astype(int), score['weighted_score'],
+              color='mediumpurple', edgecolor='black')
+for bar, k in zip(bars, score['k'].astype(int)):
+    if k == N_CLUSTERS:
+        bar.set_color('red')
+        bar.set_alpha(0.85)
+        bar.set_edgecolor('black')
+ax.axhline(score['weighted_score'].max(), color='gray', linestyle=':',
+           alpha=0.6, label='максимальный балл')
+ax.set_title('Взвешенный балл выбора числа кластеров\n'
+             'Главные критерии — устойчивость и интерпретируемость')
+ax.set_xlabel('Число кластеров')
+ax.set_ylabel('Взвешенный балл (0..1)')
+for k, v in zip(score['k'].astype(int), score['weighted_score']):
+    ax.text(k, v + 0.01, f'{v:.2f}', ha='center', fontsize=9)
+ax.set_xticks(score['k'].astype(int))
+ax.grid(alpha=0.3, axis='y')
+ax.legend(loc='lower right', fontsize=9)
+ax.text(0.02, 0.05,
+        f'Красный — k={N_CLUSTERS}. Устойчивость и интерпретируемость\n'
+        'весят больше, чем "чистая" математика силуэта.',
+        transform=ax.transAxes, fontsize=9, va='bottom',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='#EDE7F6', alpha=0.9))
+
+plt.tight_layout()
+plt.show()
+
+k4_row = k_table[k_table['k'] == 4].iloc[0]
+best_math_k = int(k_table.loc[k_table['silhouette'].idxmax(), 'k'])
+best_weighted_k = int(score.iloc[0]['k'])
+print("\n" + "=" * 100)
+print("ВЫВОД")
+print("=" * 100)
+print(f"Лучшее k по коэффициенту силуэта: {best_math_k}")
+print(f"Лучшее k по взвешенному баллу: {best_weighted_k}")
+print(f"k=4: силуэт={k4_row['silhouette']}, устойчивость={k4_row['stability_ari']}, "
+      f"интерпретируемость={k4_row['interpretability_eta2']}, "
+      f"инерция={k4_row['inertia']}")
+# ============================================================================
+# 6. Кластеризация
+# ============================================================================
+kmeans = KMeans(n_clusters=N_CLUSTERS, random_state=42, n_init=20)
+df['cluster'] = kmeans.fit_predict(X_scaled_df)
+
+agglo = AgglomerativeClustering(n_clusters=N_CLUSTERS)
+df['cluster_agglo'] = agglo.fit_predict(X_scaled_df)
+
+print("\nКачество K-Means (метод k-средних):")
+print(f"  Коэффициент силуэта: {silhouette_score(X_scaled_df, df['cluster']):.3f}")
+print(f"  Индекс Калински-Харабаша: {calinski_harabasz_score(X_scaled_df, df['cluster']):.1f}")
+print(f"  Индекс Дэвиса-Болдина: {davies_bouldin_score(X_scaled_df, df['cluster']):.3f}")
+
+print("\nКачество Agglomerative (иерархическая кластеризация):")
+print(f"  Коэффициент силуэта: {silhouette_score(X_scaled_df, df['cluster_agglo']):.3f}")
+
+# ============================================================================
+# 7. Визуализация (PCA + t-SNE)
+# ============================================================================
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled_df)
+df['pca_1'], df['pca_2'] = X_pca[:, 0], X_pca[:, 1]
+
+tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+X_tsne = tsne.fit_transform(X_scaled_df)
+df['tsne_1'], df['tsne_2'] = X_tsne[:, 0], X_tsne[:, 1]
+
+profile_for_plot = df.groupby('cluster').agg({
+    'annual_revenue': 'mean', 'cir': 'median', 'capex_rate': 'mean',
+    'expense_outpacing': 'mean', 'budget_utilization_rate': 'mean'
+})
+
+def short_label(cid):
+    r = profile_for_plot.loc[cid]
+    if r['expense_outpacing'] > 0.1 and r['budget_utilization_rate'] > 1.0:
+        return 'Зона риска'
+    if r['capex_rate'] > 0.5 and r['annual_revenue'] < 200_000_000:
+        return 'Инвест/Проект'
+    if r['annual_revenue'] > 500_000_000 and r['cir'] < 0.85:
+        return 'Драйверы'
+    return 'Поддержка'
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+fig.suptitle('Кластеры ЦФО в пространстве признаков (подписи — центры кластеров)',
+             fontsize=15)
+
+for ax, (xcol, ycol, ttl) in zip(
+        axes,
+        [('pca_1', 'pca_2', 'Метод главных компонент (PCA, Principal Component Analysis)'),
+         ('tsne_1', 'tsne_2', 'Метод t-SNE (t-distributed Stochastic Neighbor Embedding)')]):
+    sns.scatterplot(x=xcol, y=ycol, hue='cluster', data=df,
+                    palette='viridis', ax=ax, s=55, alpha=0.8)
+    for cid in sorted(df['cluster'].unique()):
+        cx = df.loc[df['cluster'] == cid, xcol].mean()
+        cy = df.loc[df['cluster'] == cid, ycol].mean()
+        ax.scatter([cx], [cy], s=260, marker='X', color='black',
+                   edgecolor='white', linewidths=1.5, zorder=10)
+        ax.annotate(f'Кластер {cid}: {short_label(cid)}', (cx, cy),
+                    textcoords='offset points', xytext=(10, 10),
+                    fontsize=10, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                              alpha=0.85, edgecolor='black'))
+    ax.set_title(f'{ttl}\nКластеры должны быть визуально разделимы')
+    ax.set_xlabel('Главная компонента 1' if 'PCA' in ttl else 'Ось t-SNE 1')
+    ax.set_ylabel('Главная компонента 2' if 'PCA' in ttl else 'Ось t-SNE 2')
+    ax.grid(alpha=0.3)
+    ax.text(0.02, 0.02,
+            'Чем дальше облака точек — тем лучше\n'
+            'кластеры отражают различия в финансах ЦФО.',
+            transform=ax.transAxes, fontsize=9, va='bottom',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='#F0F8FF', alpha=0.85))
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================================
+# 8. Автоматическая интерпретация кластеров
+# ============================================================================
+profile = df.groupby('cluster').agg({
+    'annual_revenue': 'mean',
+    'direct_expenses': 'mean',
+    'indirect_expenses': 'mean',
+    'fte_count': 'mean',
+    'budget_utilization_rate': 'mean',
+    'capex_rate': 'mean',
+    'cir': 'median',
+    'revenue_per_fte': 'mean',
+    'admin_share': 'mean',
+    'expense_outpacing': 'mean',
+    'expense_per_fte': 'mean'
+}).round(3)
+
+profile_ru = profile.rename(columns=columns_ru)
+profile_ru.index.name = 'Кластер (cluster)'
+
+print("=" * 80)
+print("ПРОФИЛИ КЛАСТЕРОВ ЦФО (средние значения)")
+print("=" * 80)
+print(profile_ru)
+
+# --- Обновлённая функция с уникальными названиями ---
+def classify_cluster(row, profile, used_types):
+    rev = row['annual_revenue']
+    cir = row['cir']
+    capex = row['capex_rate']
+    outpacing = row['expense_outpacing']
+    util = row['budget_utilization_rate']
+
+    if outpacing > 0.1 and util > 1.0:
+        base = "Зона риска / Аномальные затраты"
+        strategy = ("Срочный аудит затрат, блокировка перерасходованных лимитов, "
+                    "уведомление руководителя ЦФО, эскалация в Правление")
+        risk = 0.9
+    elif capex > 0.5 and rev < 200_000_000:
+        base = "Инвестиционные/Проектные ЦФО"
+        strategy = ("Контроль план-факта капитальных затрат (CAPEX), "
+                    "поэтапное согласование траншей, мониторинг окупаемости проекта")
+        risk = 0.4
+    elif rev > 500_000_000 and cir < 0.85:
+        # Если доход очень высокий, называем "крупными" драйверами
+        if rev > 2_000_000_000:
+            base = "Драйверы эффективности (крупные)"
+        else:
+            base = "Драйверы эффективности (средние)"
+        strategy = ("Поддерживающие условия, бенчмаркинг (сравнение с лучшими), "
+                    "тиражирование лучших практик, рассмотреть расширение лимитов")
+        risk = 0.1
+    elif rev < 100_000_000:
+        base = "Центры поддержки"
+        strategy = ("Жёсткий контроль косвенных расходов, нормирование FTE (численности), "
+                    "периодический пересмотр аллокации (распределения затрат)")
+        risk = 0.3
+    else:
+        base = "Смешанный профиль"
+        strategy = "Требуется ручной анализ"
+        risk = 0.5
+
+    # Страховка: если даже с подтипами имя занято — добавляем номер
+    final_type = base
+    n = 1
+    while final_type in used_types:
+        n += 1
+        final_type = f"{base} ({n})"
+    return final_type, strategy, risk
+
+
+# --- Исправленный цикл с передачей used_types ---
+cluster_meta = {}
+used_types = set()
+for cid in sorted(df['cluster'].unique()):
+    row = profile.loc[cid]
+    ctype, strategy, risk = classify_cluster(row, profile, used_types)
+    used_types.add(ctype)
+    cluster_meta[cid] = {
+        'type': ctype,
+        'strategy': strategy,
+        'risk_score': risk,
+        'size': int((df['cluster'] == cid).sum())
+    }
+
+df['cluster_type'] = df['cluster'].map(lambda x: cluster_meta[x]['type'])
+df['risk_score'] = df['cluster'].map(lambda x: cluster_meta[x]['risk_score'])
+
+print("\n" + "=" * 80)
+print("ИНТЕРПРЕТАЦИЯ КЛАСТЕРОВ ЦФО ДЛЯ ФИНАНСОВОГО ДЕПАРТАМЕНТА")
+print("=" * 80)
+for cid, meta in cluster_meta.items():
+    print(f"\nКластер {cid}: {meta['type']}")
+    print(f"  Размер: {meta['size']} ЦФО ({meta['size'] / len(df) * 100:.1f}%)")
+    print(f"  Оценка риска (risk_score): {meta['risk_score']}")
+    print(f"  Стратегия: {meta['strategy']}")
+
+# ============================================================================
+# 9. Визуализация бизнес-профилей кластеров
+# ============================================================================
+metrics_to_plot = ['cir', 'revenue_per_fte', 'admin_share', 'expense_outpacing',
+                   'budget_utilization_rate', 'capex_rate']
+titles = [
+    'Отношение расходов к доходам (CIR): чем ниже — тем эффективнее',
+    'Доход на одного сотрудника (FTE): чем выше — тем продуктивнее',
+    'Доля административных расходов: чем ниже — тем "суше" ЦФО',
+    'Опережение роста расходов над доходами (>0 = расходы растут быстрее)',
+    'Освоение бюджета (>1.0 = перерасход лимита)',
+    'Темп освоения капитальных затрат (CAPEX): выше — проектные ЦФО'
+]
+comments = [
+    'Драйверы — минимум,\nриск и поддержка — максимум.',
+    'У поддержки ≈0 (нет дохода),\nу драйверов — максимум.',
+    'Высокая доля у бэк-офиса —\nсигнал для аллокации.',
+    '>0.1 — опережающий\nрост затрат.',
+    '>1.0 — перерасход лимита,\nтриггер алерта.',
+    'Высокие значения —\nпроектные/инвест ЦФО.'
+]
+
+fig, axes = plt.subplots(2, 3, figsize=(19, 11))
+fig.suptitle('Профили кластеров ЦФО: бизнес-смысл каждого признака', fontsize=15)
+for i, (m, t, c) in enumerate(zip(metrics_to_plot, titles, comments)):
+    ax = axes[i // 3, i % 3]
+    df.boxplot(column=m, by='cluster', ax=ax)
+    ax.set_title(t, fontsize=11)
+    ax.set_xlabel('Кластер')
+    ax.set_ylabel('Значение')
+    ax.text(0.02, 0.95, c, transform=ax.transAxes, fontsize=8.5,
+            va='top', bbox=dict(boxstyle='round,pad=0.35',
+                                facecolor='#FFFDE7', alpha=0.9))
+plt.suptitle('')
+plt.tight_layout()
+plt.show()
+
+# ============================================================================
+# 10. Визуализация распределения типов ЦФО
+# ============================================================================
+fig, axes = plt.subplots(1, 3, figsize=(19, 6))
+fig.suptitle('Структура ЦФО по кластерам: размер, расходы, состав', fontsize=15)
+
+counts = df['cluster'].value_counts().sort_index()
+axes[0].bar(counts.index, counts.values, color='skyblue', edgecolor='black')
+axes[0].set_title('Число ЦФО по кластерам')
+axes[0].set_xlabel('Кластер')
+axes[0].set_ylabel('Количество ЦФО')
+for i, v in enumerate(counts.values):
+    axes[0].text(i, v + 1, f'{v}\n({v/len(df)*100:.0f}%)',
+                 ha='center', fontsize=9)
+axes[0].text(0.02, 0.95,
+             'Крупные кластеры → более\nстандартизированные правила для ИИ',
+             transform=axes[0].transAxes, fontsize=9, va='top',
+             bbox=dict(boxstyle='round,pad=0.4', facecolor='#E3F2FD', alpha=0.9))
+
+exp_by_cluster = df.groupby('cluster')['total_expenses'].sum() / 1e6
+axes[1].bar(exp_by_cluster.index, exp_by_cluster.values,
+            color='salmon', edgecolor='black')
+axes[1].set_title('Суммарные расходы по кластерам, млн руб.')
+axes[1].set_xlabel('Кластер')
+axes[1].set_ylabel('млн руб.')
+for i, v in zip(exp_by_cluster.index, exp_by_cluster.values):
+    axes[1].text(i, v + max(exp_by_cluster.values) * 0.02, f'{v:,.0f}',
+                 ha='center', fontsize=9)
+axes[1].text(0.02, 0.95,
+             'Чем больше расходов в кластере,\nтем выше приоритет его автопроверки',
+             transform=axes[1].transAxes, fontsize=9, va='top',
+             bbox=dict(boxstyle='round,pad=0.4', facecolor='#FFEBEE', alpha=0.9))
+
+ct = pd.crosstab(df['cfo_type'], df['cluster'])
+sns.heatmap(ct, annot=True, fmt='d', cmap='YlOrRd', ax=axes[2],
+            cbar_kws={'label': 'количество ЦФО'})
+axes[2].set_title('Матрица: тип ЦФО × кластер\nОдин тип ЦФО может попадать в разные кластеры')
+axes[2].set_xlabel('Кластер')
+axes[2].set_ylabel('Тип ЦФО')
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================================
+# 11. Проверка гипотез: зона риска
+# ============================================================================
+risk_cluster_id = [cid for cid, m in cluster_meta.items() if 'риск' in m['type'].lower()]
+
+if risk_cluster_id:
+    rc = risk_cluster_id[0]
+    risk_df = df[df['cluster'] == rc]
+    print(f"\n{'=' * 80}")
+    print(f"КЛАСТЕР РИСКА (id={rc}): найдено {len(risk_df)} ЦФО")
+    print(f"Средний перерасход: {(risk_df['budget_utilization_rate'].mean() - 1) * 100:.1f}%")
+    print(f"Средний опережающий рост расходов: {risk_df['expense_outpacing'].mean():.2%}")
+    print(f"Суммарный потенциальный перерасход: "
+          f"{(risk_df['total_expenses'].sum() * (risk_df['budget_utilization_rate'].mean() - 1)) / 1e6:.1f} млн руб.")
+
+    top5 = risk_df.nlargest(5, 'budget_utilization_rate')[
+        ['cfo_id', 'cfo_type', 'budget_utilization_rate', 'expense_outpacing']
+    ].rename(columns={
+        'cfo_id': 'Идентификатор ЦФО (cfo_id)',
+        'cfo_type': 'Тип ЦФО (cfo_type)',
+        'budget_utilization_rate': 'Освоение бюджета (budget_utilization_rate)',
+        'expense_outpacing': 'Опережение роста расходов (expense_outpacing)',
+    })
+    print(f"\nТоп-5 ЦФО по риску:")
+    print(top5.to_string(index=False))
+
+# ============================================================================
+# 12. Дендрограмма
+# ============================================================================
+sample_idx = np.random.choice(len(X_scaled_df), min(120, len(X_scaled_df)), replace=False)
+X_sample = X_scaled_df.iloc[sample_idx]
+linked = linkage(X_sample, method='ward')
+
+THRESHOLD = 15
+fig, ax = plt.subplots(figsize=(16, 8))
+
+dendro = dendrogram(
+    linked,
+    orientation='top',
+    distance_sort='descending',
+    show_leaf_counts=False,
+    color_threshold=THRESHOLD,
+    above_threshold_color='lightgray',
+    ax=ax,
+    truncate_mode='level',
+    p=5,
+    no_labels=True,
+)
+
+blocks = defaultdict(list)
+for icoord, color in zip(dendro['icoord'], dendro['color_list']):
+    x_center = float(np.mean(icoord))
+    blocks[color].append(x_center)
+
+ordered_blocks = sorted(
+    [(c, xs) for c, xs in blocks.items() if c != 'lightgray'],
+    key=lambda item: np.mean(item[1])
+)
+
+for cluster_idx, (color, xs) in enumerate(ordered_blocks, start=0):
+    x_center = float(np.mean(xs))
+    ax.text(x_center, -1.5, f'Кластер {cluster_idx}',
+            ha='center', va='top', fontsize=11, fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor=color,
+                      alpha=0.6, edgecolor='black'))
+
+ax.axhline(y=THRESHOLD, color='red', linestyle='--', linewidth=1.6)
+ax.text(ax.get_xlim()[1] * 0.99, THRESHOLD + 0.4,
+        f'Порог = {THRESHOLD}: ниже него 4 кластера',
+        ha='right', va='bottom', fontsize=10, color='red',
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                  edgecolor='red', alpha=0.95))
+
+ax.set_title('Дендрограмма ЦФО: как алгоритм объединяет подразделения в группы (читается снизу вверх)\n'
+             'Каждая горизонтальная черта — слияние: чем ниже — тем более похожи ЦФО по финансам',
+             fontsize=13)
+ax.set_xlabel('Порядок ЦФО на графике (не имеет бизнес-смысла, нужен только для наглядности)')
+ax.set_ylabel('Расстояние между ЦФО\n(0 — одинаковые, максимум — максимально разные)')
+ax.grid(alpha=0.3, axis='y')
+ax.set_ylim(-3, ax.get_ylim()[1])
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================================
+# 13. Важность признаков
+# ============================================================================
+X_feat = df[features_for_clustering].fillna(0)
+y = df['cluster']
+
+rf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+rf.fit(X_feat, y)
+
+perm = permutation_importance(rf, X_feat, y, n_repeats=10, random_state=42, n_jobs=-1)
+
+feature_ru = {
+    'annual_revenue': 'Доходы ЦФО',
+    'direct_expenses': 'Прямые расходы',
+    'indirect_expenses': 'Косвенные (аллоцированные) расходы',
+    'fte_count': 'Численность персонала (FTE)',
+    'budget_utilization_rate': 'Освоение бюджета (утилизация лимитов)',
+    'capex_rate': 'Темп освоения капитальных затрат (CAPEX)',
+    'cir': 'Отношение расходов к доходам (CIR)',
+    'revenue_per_fte': 'Доход на одного сотрудника (FTE)',
+    'admin_share': 'Доля административных расходов',
+    'expense_growth': 'Рост расходов',
+    'revenue_growth': 'Рост доходов',
+    'expense_outpacing': 'Опережение роста расходов над доходами',
+    'expense_per_fte': 'Расходы на одного сотрудника (FTE)',
+    'budget_deviation': 'Отклонение от лимита',
+    'cfo_type_encoded': 'Тип ЦФО',
+    'division_encoded': 'Подразделение',
+}
+
+imp = pd.DataFrame({
+    'feature': features_for_clustering,
+    'gini': rf.feature_importances_,
+    'perm': perm.importances_mean
+})
+imp['feature_ru'] = imp['feature'].map(feature_ru).fillna(imp['feature'])
+imp = imp.sort_values('gini', ascending=False).reset_index(drop=True)
+
+fig, ax = plt.subplots(figsize=(13, 9))
+top = imp.head(15)
+
+bars = ax.barh(top['feature_ru'][::-1], top['gini'][::-1],
+               color='steelblue', edgecolor='black')
+
+ax.set_title('Топ-15 признаков, определяющих сегментацию ЦФО\n'
+             'Чем длиннее столбец — тем сильнее признак разделяет кластеры',
+             fontsize=13)
+ax.set_xlabel('Важность признака (доля вклада в разделение, 0..1)')
+ax.set_ylabel('Признак')
+ax.grid(alpha=0.3, axis='x')
+
+for bar, val in zip(bars, top['gini'][::-1]):
+    ax.text(bar.get_width() + 0.002,
+            bar.get_y() + bar.get_height() / 2,
+            f'{val:.3f}', va='center', fontsize=9)
+
+top5_ru = ', '.join(top['feature_ru'].head(5).tolist())
+ax.text(0.02, 0.02,
+        f'Топ-5 признаков: {top5_ru}.\n'
+        'На них стоит опираться при автоматической разметке новых ЦФО.',
+        transform=ax.transAxes, fontsize=9, va='bottom',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='#E8F5E9', alpha=0.9))
+
+plt.tight_layout()
+plt.show()
+
+print("\nТоп-5 признаков сегментации:")
+for _, r in imp.head(5).iterrows():
+    print(f"  - {r['feature_ru']} ({r['feature']}): "
+          f"важность={r['gini']:.3f}, перестановочная важность={r['perm']:.4f}")
+
+# ============================================================================
+# 14. Рекомендации
+# ============================================================================
+recommendations = {
+    'Зона риска (аномальные затраты)':
+        'Внедрить автоматические оповещения при освоении бюджета > 1.0 '
+        'или опережении роста расходов > 15%. Блокировка новых заявок до аудита.',
+    'Центры поддержки':
+        'Нормировать численность (FTE) и административные расходы. Пересматривать '
+        'распределение косвенных затрат (аллокацию) ежеквартально на основе '
+        'фактического потребления услуг.',
+    'Драйверы эффективности':
+        'Использовать как эталон (бенчмарк). Рассмотреть перераспределение лимитов '
+        'в пользу этих ЦФО (инвестиции в рост).',
+    'Инвестиционные / Проектные ЦФО':
+        'Контроль план-факта капитальных затрат (CAPEX) через поэтапные этапы '
+        '(stage-gate). Мониторинг чистой приведённой стоимости (NPV) и внутренней '
+        'нормы доходности (IRR) каждого проекта раз в месяц.',
+    'Для ИИ-агента (поиск по документам + действия)':
+        'На основе кластера и оценки риска автоматически: (1) искать релевантные '
+        'пункты Регламента (поиск с генерацией ответа, RAG), (2) создавать задачи '
+        'в трекере (доп. соглашение, блокировка лимита, уведомление руководителя ЦФО), '
+        '(3) логировать инцидент.'
+}
+
+print("\n" + "=" * 80)
+print("РЕКОМЕНДАЦИИ ДЛЯ ФИНАНСОВОГО ДЕПАРТАМЕНТА")
+print("=" * 80)
+for k, v in recommendations.items():
+    print(f"\n{k}:\n  {v}")
+
+# ============================================================================
+# 15. Сохранение результатов
+# ============================================================================
+cols_to_save = ['cfo_id', 'cfo_type', 'division', 'cluster', 'cluster_type', 'risk_score'] + \
+               ['annual_revenue', 'direct_expenses', 'indirect_expenses', 'fte_count',
+                'budget_utilization_rate', 'capex_rate', 'cir', 'revenue_per_fte',
+                'admin_share', 'expense_outpacing']
+
+df[cols_to_save].to_csv('cfo_with_clusters.csv', index=False)
+print("\nРезультаты сохранены в файл: cfo_with_clusters.csv")
+
+print("\n" + "=" * 80)
+print("ИТОГОВАЯ СВОДКА")
+print("=" * 80)
+summary = df.groupby(['cluster', 'cluster_type']).agg(
+    count=('cfo_id', 'count'),
+    avg_cir=('cir', 'median'),
+    avg_utilization=('budget_utilization_rate', 'mean'),
+    total_expenses_mn=('total_expenses', lambda s: round(s.sum() / 1e6, 1))
+).round(2)
+summary.columns = ['Количество ЦФО', 'Медиана CIR (расходы/доходы)',
+                   'Среднее освоение бюджета', 'Суммарные расходы, млн руб.']
+summary.index.names = ['Кластер (cluster)', 'Тип кластера (cluster_type)']
+print(summary)
