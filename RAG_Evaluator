@@ -195,11 +195,19 @@ class CleanlabRAGEvaluatorYandex(Component):
         except Exception as e:
             output_result = f"Error calling Yandex OpenAI-API: {str(e)}"
 
-        # Парсинг оценок
+        # Парсинг оценок (улучшенный regex: учитывает возможные звездочки Markdown, скобки и пробелы)
         if output_result and not output_result.startswith("Error calling Yandex"):
             try:
-                faith_match = re.search(r'(?:Обоснованность|Faithfulness)\s*[:\-]?\s*(\d+(?:[.,]\d+)?)', output_result, re.IGNORECASE)
-                rel_match = re.search(r'(?:Релевантность|Relevance)\s*[:\-]?\s*(\d+(?:[.,]\d+)?)', output_result, re.IGNORECASE)
+                faith_match = re.search(
+                    r'(?:Обоснованность|Faithfulness)[\*\s:\-\[]*(\d+(?:[.,]\d+)?)',
+                    output_result,
+                    re.IGNORECASE,
+                )
+                rel_match = re.search(
+                    r'(?:Релевантность|Relevance)[\*\s:\-\[]*(\d+(?:[.,]\d+)?)',
+                    output_result,
+                    re.IGNORECASE,
+                )
 
                 if faith_match:
                     faithfulness_score = float(faith_match.group(1).replace(',', '.'))
@@ -210,12 +218,25 @@ class CleanlabRAGEvaluatorYandex(Component):
 
         # Логирование в Phoenix через session-аннотации
         if (faithfulness_score is not None or relevance_score is not None) and not output_result.startswith("Error calling Yandex"):
+            # 1. Ручной ID из настроек компонента
             session_id = (self.session_id or "").strip()
+
+            # 2. ID из объекта Message (если передан через API или новый чат)
+            if not session_id and hasattr(self.query, "session_id") and self.query.session_id:
+                session_id = str(self.query.session_id).strip()
+
+            # 3. ID сессии графа
+            if not session_id and hasattr(self, "graph") and getattr(self.graph, "session_id", None):
+                session_id = str(self.graph.session_id).strip()
+
+            # 4. Фолбэк на flow_id (именно его Playground Langflow использует как session_id по умолчанию)
+            if not session_id and hasattr(self, "graph") and getattr(self.graph, "flow_id", None):
+                session_id = str(self.graph.flow_id).strip()
+
             if not session_id:
-                print("[Phoenix] session_id не задан, аннотации не отправлены")
+                print("[Phoenix] session_id не найден, аннотации не отправлены")
             else:
                 print(f"[Phoenix] Отправка session-аннотаций для session_id={session_id}")
-
                 if faithfulness_score is not None:
                     self._send_phoenix_session_annotation(
                         session_id, "faithfulness", faithfulness_score, output_result
@@ -224,6 +245,7 @@ class CleanlabRAGEvaluatorYandex(Component):
                     self._send_phoenix_session_annotation(
                         session_id, "answer_relevance", relevance_score, output_result
                     )
+
 
         meta = {
             "faithfulness": faithfulness_score,
